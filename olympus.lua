@@ -240,8 +240,10 @@ local GameConfig = {
         ["rbxassetid://128921678079615"] = {
             DisplayName = "M2",
             ReactionTime = 0.40,
+            BoxingM2 = true,  -- gated by CFG.AutoBoxingM2
             -- Custom sequence: wait → block → dodge (original behavior)
             ParryFunction = function(data)
+                if not CFG.AutoBoxingM2 then return end
                 if data.RegistryData and data.RegistryData.Processed then return end
                 if data.RegistryData then data.RegistryData.Processed = true end
                 task.spawn(function()
@@ -249,7 +251,7 @@ local GameConfig = {
                     BlockStart(os.clock(), 0.50)
                     if CFG.AutoDodge then
                         task.wait(0.30)
-                        Dodge(true)  -- already gated by CFG.AutoDodge above
+                        Dodge(true)
                     end
                 end)
             end,
@@ -899,7 +901,7 @@ end
 
 -- ── State ───────────────────────────────────
 local CFG = {
-    Enabled=true,AutoDodge=true,MultiTarget=true,AutoTargetNearest=true,
+    Enabled=true,AutoDodge=true,AutoBoxingM2=true,MultiTarget=true,AutoTargetNearest=true,
     CycleRange=20,APRange=10,ParryOffset=0,ParryHold=0.27,ParryWindow=0.20,AutoHeight=true,HeightInfluence=1,
     PingCompensate=true,ProbabilityToParry=100,
     Debug=false,APKeybind="g",
@@ -1127,8 +1129,18 @@ local function ExecuteParry(regData, attackConfig)
 end
 
 -- Custom ParryFunction support (Boxing M2 etc.)
+-- Returns true if this anim is handled by ParryFunction (caller should skip normal path).
+-- When AutoBoxingM2 is OFF, Boxing M2 is still "consumed" so AP won't try a normal parry/dodge —
+-- player handles it manually.
 local function TryParryFunction(regData, attackConfig, character, animId)
     if type(attackConfig.ParryFunction) ~= "function" then return false end
+
+    -- Boxing M2 opt-out: leave it entirely to the player
+    if attackConfig.BoxingM2 and not CFG.AutoBoxingM2 then
+        regData.Processed = true
+        return true  -- consumed, no auto action
+    end
+
     local now = os.clock()
     local rt = attackConfig.ReactionTime or attackConfig.ParryTime or DefaultRT
     local window = tonumber(CFG.ParryWindow) or 0.20
@@ -1169,10 +1181,29 @@ local function getAnims(character)
     return _animScratch
 end
 
--- ── Rhythm Auto-Hit (was "Auto Play") ───────
-local Receptors = { Receptor1="X", Receptor2="C", Receptor3="N", Receptor4="M" }
+-- ── Rhythm Auto-Hit ───────
+-- Hardcoded keys (set these in Gakuran rhythm settings):
+--   4-lane: Z  X  ,  .
+--   2-lane: F  J
+local Receptors = {
+    Receptor1 = "Z",
+    Receptor2 = "X",
+    Receptor3 = ",",
+    Receptor4 = ".",
+}
 local ReceptorXMap = {}
+local HeldKeys = {}
 local LastRhythmCache = 0
+local Threshold = 30
+
+local function rhythmKeyByte(key)
+    if not key then return nil end
+    key = tostring(key)
+    if key == "," then return 0xBC end
+    if key == "." then return 0xBE end
+    if #key == 1 then return string.byte(key:upper()) end
+    return string.byte(key:sub(1, 1):upper())
+end
 
 function RhythmAutoHitTick()
     local gui = LocalPlayer:FindFirstChild("PlayerGui")
@@ -1192,50 +1223,82 @@ function RhythmAutoHitTick()
         for name, key in pairs(Receptors) do
             local rec = ReceptorLookup:FindFirstChild(name)
             if rec then
-                count += 1
+                count = count + 1
                 local rx = math.floor(rec.AbsolutePosition.X + rec.AbsoluteSize.X / 2)
-                ReceptorXMap[rx] = { Key = key, Name = name }
+                ReceptorXMap[rx] = { ReceptorName = name, Key = key, Receptor = rec }
             end
         end
         if count == 2 then
-            Receptors.Receptor1, Receptors.Receptor2 = "F", "J"
+            Receptors.Receptor1 = "F"
+            Receptors.Receptor2 = "J"
         else
-            Receptors.Receptor1, Receptors.Receptor2 = "X", "C"
+            Receptors.Receptor1 = "Z"
+            Receptors.Receptor2 = "X"
+            Receptors.Receptor3 = ","
+            Receptors.Receptor4 = "."
+        end
+        -- re-map with updated keys
+        table.clear(ReceptorXMap)
+        for name, key in pairs(Receptors) do
+            local rec = ReceptorLookup:FindFirstChild(name)
+            if rec then
+                local rx = math.floor(rec.AbsolutePosition.X + rec.AbsoluteSize.X / 2)
+                ReceptorXMap[rx] = { ReceptorName = name, Key = key, Receptor = rec }
+            end
         end
         LastRhythmCache = now
     end
 
-    local threshold = 30
     for _, note in pairs(Lanes:GetChildren()) do
-        if note.Name == "NoteTemplate" then
-            local noteX = math.floor(note.AbsolutePosition.X + note.AbsoluteSize.X / 2)
-            local noteY = note.AbsolutePosition.Y
-            local match
-            for rx, data in pairs(ReceptorXMap) do
-                if math.abs(noteX - rx) <= 10 then
-                    match = data
-                    break
+        if note.Name ~= "NoteTemplate" then continue end
+        local notePos = note.AbsolutePosition
+        local noteSize = note.AbsoluteSize
+        local noteX = math.floor(notePos.X + noteSize.X / 2)
+
+        local match
+        for rx, data in pairs(ReceptorXMap) do
+            if math.abs(noteX - rx) <= 10 then
+                match = data
+                break
+            end
+        end
+        if not match then continue end
+
+        local receptor = match.Receptor
+        local receptorPos = receptor.AbsolutePosition
+        local key = match.Key
+        local rName = match.ReceptorName
+        local b = rhythmKeyByte(key)
+        if not b then continue end
+
+        local tail = note:FindFirstChild("Tail")
+        local hasTail = tail and tail.AbsoluteSize and tail.AbsoluteSize.Y > 0
+
+        if hasTail then
+            local whenHold = (tail.AbsolutePosition.Y + tail.AbsoluteSize.Y) - receptorPos.Y
+            if whenHold + 15 > Threshold then
+                if not HeldKeys[rName] then
+                    HeldKeys[rName] = true
+                    pcall(function() keypress(b) end)
                 end
             end
-            if match then
-                local rec = ReceptorLookup:FindFirstChild(match.Name)
-                if rec then
-                    local dy = math.abs((noteY + note.AbsoluteSize.Y / 2) - (rec.AbsolutePosition.Y + rec.AbsoluteSize.Y / 2))
-                    if dy <= threshold then
-                        local key = match.Key
-                        pcall(function()
-                            local code = Enum.KeyCode[key]
-                            if code and keypress then
-                                -- try virtual key byte if letter
-                            end
-                            if typeof(key) == "string" and #key == 1 then
-                                local b = string.byte(key:upper())
-                                keypress(b)
-                                keyrelease(b)
-                            end
-                        end)
-                    end
+            if HeldKeys[rName] then
+                if (tail.AbsolutePosition.Y - receptorPos.Y) > 0 then
+                    HeldKeys[rName] = nil
+                    pcall(function() keyrelease(b) end)
                 end
+            end
+        else
+            if math.abs(notePos.Y - receptorPos.Y) < Threshold then
+                if HeldKeys[rName] then
+                    pcall(function() keyrelease(b) end)
+                    HeldKeys[rName] = nil
+                end
+                task.spawn(function()
+                    pcall(function() keypress(b) end)
+                    task.wait(0.05)
+                    pcall(function() keyrelease(b) end)
+                end)
             end
         end
     end
@@ -1670,6 +1733,7 @@ local function applySettings(s)
     local function setToggle(ref,val) if ref and val~=nil then pcall(function() ref:Set(val) end) end end
     if s.Enabled     ~=nil then CFG.Enabled=s.Enabled         setToggle(UIRefs.Armed,s.Enabled) end
     if s.AutoDodge   ~=nil then CFG.AutoDodge=s.AutoDodge     setToggle(UIRefs.AutoDodge,s.AutoDodge) end
+    if s.AutoBoxingM2~=nil then CFG.AutoBoxingM2=s.AutoBoxingM2 setToggle(UIRefs.AutoBoxingM2,s.AutoBoxingM2) end
     if s.MultiTarget ~=nil then CFG.MultiTarget=s.MultiTarget setToggle(UIRefs.MultiTarget,s.MultiTarget) end
     if s.Debug       ~=nil then CFG.Debug=s.Debug             setToggle(UIRefs.Debug,s.Debug) end
     if s.CycleRange        then CFG.CycleRange=s.CycleRange   setSlider(UIRefs.CycleRange,s.CycleRange) end
@@ -1730,7 +1794,8 @@ ProfilesSec:Button("Save Current",function()
         Timings=t,
         Settings={
             -- toggles
-            Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, MultiTarget=CFG.MultiTarget,
+            Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
+            MultiTarget=CFG.MultiTarget,
             Debug=CFG.Debug,
             -- facing conditions
             TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
@@ -1831,21 +1896,62 @@ pcall(function()
 end)
 
 UIRefs.AutoDodge = ArmedSec:Toggle("Auto Dodge Heavy", true, function(v) CFG.AutoDodge = v end)
+UIRefs.AutoBoxingM2 = ArmedSec:Toggle("Auto Boxing M2", true, function(v)
+    CFG.AutoBoxingM2 = v
+    pcall(function()
+        UI_Library:Notify("Boxing M2", v and "AP will handle Boxing M2" or "Manual — AP ignores Boxing M2")
+    end)
+end)
+ArmedSec:Info("OFF = you parry/dodge Boxing M2 yourself. ON = AP block→dodge sequence.")
 UIRefs.MultiTarget = ArmedSec:Toggle("Multiple Targets", true, function(v) CFG.MultiTarget = v end)
 UIRefs.AutoTargetNearest = ArmedSec:Toggle("Auto Target Nearest", true, function(v) CFG.AutoTargetNearest = v end)
 
-readAPKeybind = function()
+-- Extract key string from whatever the INS keybind object exposes
+local function extractKeyFromObj(obj)
+    if not obj then return nil end
     local k = nil
     pcall(function()
-        if APKeybindObj then
-            if type(APKeybindObj.Get) == "function" then k = APKeybindObj:Get()
-            elseif APKeybindObj.Value then k = APKeybindObj.Value
-            elseif APKeybindObj.Key then k = APKeybindObj.Key
-            end
+        if type(obj.Get) == "function" then
+            k = obj:Get()
+        elseif type(obj.GetKey) == "function" then
+            k = obj:GetKey()
+        elseif type(obj.GetValue) == "function" then
+            k = obj:GetValue()
         end
     end)
-    if type(k) ~= "string" or #k == 0 then k = CFG.APKeybind or "g" end
-    return tostring(k)
+    if type(k) == "table" then
+        k = k[1] or k.Key or k.Value or k.Name
+    end
+    if type(k) == "EnumItem" then
+        k = tostring(k):match("KeyCode%.(.+)$") or tostring(k)
+    end
+    if (not k or k == "") then
+        for _, prop in ipairs({ "Value", "Key", "KeyCode", "Bind", "Current", "Text", "Name" }) do
+            local v = nil
+            pcall(function() v = obj[prop] end)
+            if type(v) == "string" and #v > 0 and #v < 20 then k = v break end
+            if type(v) == "EnumItem" then
+                k = tostring(v):match("KeyCode%.(.+)$") or tostring(v)
+                break
+            end
+        end
+    end
+    if type(k) == "string" and #k > 0 then
+        k = k:gsub("%s+", "")
+        -- strip "KeyCode." prefix if present
+        k = k:match("KeyCode%.(.+)$") or k
+        return k
+    end
+    return nil
+end
+
+readAPKeybind = function()
+    local k = extractKeyFromObj(APKeybindObj)
+    if type(k) == "string" and #k > 0 then
+        CFG.APKeybind = k  -- keep CFG in sync when pill changes
+        return k
+    end
+    return tostring(CFG.APKeybind or "g")
 end
 
 writeAPKeybind = function(key)
@@ -1853,15 +1959,39 @@ writeAPKeybind = function(key)
     local s = tostring(key):gsub("%s+", "")
     if s == "" then return end
     CFG.APKeybind = s
+    local applied = false
     pcall(function()
-        if APKeybindObj then
-            if type(APKeybindObj.Set) == "function" then APKeybindObj:Set(s)
-            elseif type(APKeybindObj.SetKey) == "function" then APKeybindObj:SetKey(s)
-            elseif APKeybindObj.Value ~= nil then APKeybindObj.Value = s
+        if not APKeybindObj then return end
+        if type(APKeybindObj.Set) == "function" then APKeybindObj:Set(s) applied = true end
+        if type(APKeybindObj.SetKey) == "function" then APKeybindObj:SetKey(s) applied = true end
+        if type(APKeybindObj.SetValue) == "function" then APKeybindObj:SetValue(s) applied = true end
+        if APKeybindObj.Value ~= nil then APKeybindObj.Value = s applied = true end
+        if APKeybindObj.Key ~= nil then APKeybindObj.Key = s applied = true end
+    end)
+    -- Last resort: re-create the keybind pill with the saved key
+    if not applied then
+        pcall(function()
+            if APToggleElement and APToggleElement.AddKeybind then
+                APKeybindObj = APToggleElement:AddKeybind(s, "Toggle")
             end
+        end)
+    end
+end
+
+-- Keep CFG.APKeybind synced from the pill so Save stores the real bind
+OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
+    if not OlympusState.Alive then return end
+    -- cheap: only every ~1s
+    local t = os.clock()
+    if (OlympusState._lastKbSync or 0) + 1 > t then return end
+    OlympusState._lastKbSync = t
+    pcall(function()
+        local k = extractKeyFromObj(APKeybindObj)
+        if type(k) == "string" and #k > 0 and k:lower() ~= tostring(CFG.APKeybind or ""):lower() then
+            CFG.APKeybind = k
         end
     end)
-end
+end))
 
 CondSec:Info("Gate parry per target based on facing direction")
 UIRefs.TargetFacingYou=CondSec:Toggle("Target facing you",false,function(v) CFG.TargetFacingYou=v end)
@@ -2045,9 +2175,9 @@ end)
 MiscSec:Info("Plays a click sound each time F is pressed")
 UIRefs.RhythmAutoHit = MiscSec:Toggle("Rhythm Auto-Hit", false, function(v)
     CFG.RhythmAutoHit = v
-    UI_Library:Notify("Rhythm Auto-Hit", v and "ON — note minigame keys" or "OFF")
+    UI_Library:Notify("Rhythm Auto-Hit", v and "ON — set keys to Z X , . (4) or F J (2)" or "OFF")
 end)
-MiscSec:Info("Auto-hits rhythm/note lanes (was Auto Play in original)")
+MiscSec:Info("Requires Gakuran keybinds: 4-lane = Z X Comma Period | 2-lane = F J")
 MiscSec:Button("Unload Olympus",function()
     pcall(function()
         if _G.__OlympusAP and _G.__OlympusAP.Cleanup then
