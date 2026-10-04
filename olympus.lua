@@ -1,10 +1,14 @@
 
 -- =============================================
--- Olympus Auto Parry — v9.3
+-- Olympus Auto Parry — v9.4
+-- + Open-source registry + continuous window (lolbeans style)
+-- + ConstLatency start-time, loop re-arm, consistent PARRYING
 -- + Ping compensation, Parry Window, Probability
 -- + ParryFunction, IgnoreIds, state anim lists
 -- + Auto Target Nearest, Rhythm Auto-Hit
 -- + BlockStart/BlockEnd, cleanup on re-inject
+-- - Heavy Ready removed (was inaccurate)
+-- - Global PARRY_CD removed (per-anim EXECUTE_DEBOUNCE instead)
 -- =============================================
 
 -- Cleanup previous inject
@@ -900,7 +904,6 @@ local CFG = {
     PingCompensate=true,ProbabilityToParry=100,
     Debug=false,APKeybind="g",
     SoundOnParry=false,
-    HeavyReadyNotify=true, HeavyCooldown=3.0,
     RhythmAutoHit=false,  -- rhythm note auto-hit (was Auto Play)
     AntiAFK=false, AFKInterval=240,
     AutoRespawn=false, RespawnDelay=1.5,
@@ -926,7 +929,7 @@ local function GetPingValue()
     return 50
 end
 
--- ── BlockStart / BlockEnd / Dodge (state-aware) ──
+-- ── BlockStart / BlockEnd / Dodge (state-aware, open-source style) ──
 local ParryState = {
     IDLE = "idle",
     INPUT_PENDING = "input_pending",
@@ -938,6 +941,9 @@ local KeyHeld = false
 local ReleaseDeadline = 0
 local LocalStunned = false
 local LocalParrying = false
+local InputRegisteredTime = nil
+local ParryRegisteredTime = nil
+local LastPendingRegData = nil
 
 local function TransitionToState(s)
     CurrentParryState = s
@@ -948,9 +954,12 @@ function BlockStart(StartTime, HoldFor)
     if not CFG.Enabled then return end
     if LocalStunned then return end
     local hold = HoldFor or CFG.ParryHold or 0.27
-    ReleaseDeadline = StartTime + hold
+    ReleaseDeadline = os.clock() + hold
     KeyHeld = true
-    TransitionToState(ParryState.INPUT_PENDING)
+    if CurrentParryState == ParryState.IDLE then
+        InputRegisteredTime = os.clock()
+        TransitionToState(ParryState.INPUT_PENDING)
+    end
     pcall(function() keypress(ParryKey) end)
 end
 
@@ -961,100 +970,24 @@ function BlockEnd()
 end
 
 function Dodge(force)
-    -- force=true bypasses the AutoDodge toggle (manual/debug only)
     if not force and not CFG.AutoDodge then
         return
     end
     BlockEnd()
     pcall(function()
-        for _ = 1, 8 do
+        for _ = 1, 12 do
             keypress(DodgeKey)
             keyrelease(DodgeKey)
         end
     end)
 end
 
--- ── Parry Queue ─────────────────────────────
-local pendingParries = {}
-local scheduledMap   = {}
-local lastParryFire  = 0
-local PARRY_CD       = 0.05
-local parryCount     = 0
-local menuOpen       = true
-
-local function ensureGameInput()
-end
-
-local function tickParryQueue()
-    local now = os.clock()
-    local i = 1
-    while i <= #pendingParries do
-        local e = pendingParries[i]
-        local removed = false
-
-        if not e.fired and now >= e.fireAt then
-            if CFG.Enabled and (now - lastParryFire) >= PARRY_CD then
-                lastParryFire = now
-                e.fired = true
-                e.releaseAt = now + CFG.ParryHold
-                ensureGameInput()
-                if LocalStunned then
-                    e.fired = true
-                    e.releaseAt = now
-                -- ForceParry (Aikido/WingChun counters): always F, never Q
-                elseif e.config.ForceParry then
-                    BlockStart(now, CFG.ParryHold)
-                    e.releaseAt = now + (CFG.ParryHold or 0.27)
-                elseif e.config.Heavy and CFG.AutoDodge then
-                    Dodge()
-                    e.releaseAt = now
-                else
-                    BlockStart(now, CFG.ParryHold)
-                    e.releaseAt = now + (CFG.ParryHold or 0.27)
-                end
-                parryCount = (parryCount or 0) + 1
-
-                -- sound feedback (optional)
-                if CFG.SoundOnParry then
-                    pcall(function()
-                        local s = Instance.new("Sound")
-                        s.SoundId = "rbxassetid://6026984224"  -- clean click
-                        s.Volume = 0.4
-                        s.Parent = game:GetService("SoundService")
-                        s:Play()
-                        game:GetService("Debris"):AddItem(s, 2)
-                    end)
-                end
-
-                if CFG.Debug and UI_Library then
-                    pcall(function()
-                        UI_Library:Notify("AP fired",
-                            (e.config.Style or "?") .. " | " .. (e.config.DisplayName or "?") ..
-                            " | waited " .. string.format("%.3f", e.delay) .. "s")
-                        print("[Olympus AP]", e.config.Style, e.config.DisplayName,
-                            "delay=" .. string.format("%.3f", e.delay))
-                    end)
-                end
-            elseif not CFG.Enabled then
-                table.remove(pendingParries, i) removed = true
-            elseif now > e.fireAt + 0.12 then
-                table.remove(pendingParries, i) removed = true
-            end
-        end
-
-        if not removed then
-            if e.fired and now >= (e.releaseAt or now) then
-                ensureGameInput()
-                BlockEnd()
-                table.remove(pendingParries, i) removed = true
-            elseif not e.fired and now > e.fireAt + 0.25 then
-                table.remove(pendingParries, i) removed = true
-            end
-        end
-
-        if not removed then i = i + 1 end
-    end
-end
+-- ── Open-source style Animation Registry + continuous window ──
+local AnimationRegistry = {}
+local ConstLatency     = 0.018   -- matches lolbeans67
+local EXECUTE_DEBOUNCE = 0.5     -- per-animation, replaces global PARRY_CD
+local parryCount       = 0
+local menuOpen         = true
 
 local function heightScale(character)
     local hum = character and character:FindFirstChildWhichIsA("Humanoid")
@@ -1064,69 +997,155 @@ local function heightScale(character)
     return 1
 end
 
-local function queueParry(id, timePos, config, character)
-    local now = os.clock()
-    if LocalStunned then return end
-
-    -- Probability gate
-    local prob = tonumber(CFG.ProbabilityToParry) or 100
-    if prob < 100 and math.random(1, 100) > prob then
-        return
-    end
-
-    local rt = config.ReactionTime or config.ParryTime or DefaultRT
+local function CalculateParryTiming(attackConfig, StartTime, Target)
+    local optimalRT = attackConfig.ReactionTime or attackConfig.ParryTime or DefaultRT
+    local heightMul = 1
     if CFG.AutoHeight then
         local inf = tonumber(CFG.HeightInfluence) or 1
-        local s = heightScale(character)
-        rt = rt * (1 + (s - 1) * inf)
+        local s = heightScale(Target)
+        heightMul = 1 + (s - 1) * inf
     end
-
-    -- Ping compensation: subtract half RTT (ms → s)
     if CFG.PingCompensate then
         local half = (GetPingValue() / 1000) * 0.5
-        rt = rt - half
-        if rt < 0 then rt = 0 end
+        optimalRT = optimalRT - half
+        if optimalRT < 0 then optimalRT = 0 end
     end
-
-    local animStart = now - timePos
+    local adjusted = (optimalRT * heightMul) + (CFG.ParryOffset or 0)
     local window = tonumber(CFG.ParryWindow) or 0.20
-    local fireAt = animStart + rt + (CFG.ParryOffset or 0)
-    local windowEnd = fireAt + window
+    local blockStart = StartTime + adjusted
+    local blockExpire = StartTime + adjusted + window
+    return blockStart, blockExpire
+end
 
-    local key = id .. string.format("%.2f", animStart)
-    if scheduledMap[key] then return end
-
-    -- Too late entirely
-    if now > windowEnd + 0.02 then return end
-    if fireAt < now - 0.05 then
-        -- still inside window → fire ASAP
-        fireAt = now
+local function UpdateAnimationRegistry(animKey, animId, now, currentTrackTime, attackConfig, TargetCharacter)
+    if not AnimationRegistry[animKey] then
+        local adjustedNow = now - ConstLatency
+        local blockStart, blockExpire = CalculateParryTiming(attackConfig, adjustedNow, TargetCharacter)
+        AnimationRegistry[animKey] = {
+            StartTime        = adjustedNow,
+            Processed        = false,
+            CurrentTrackTime = currentTrackTime,
+            AnimationId      = animId,
+            DidALoop         = false,
+            BlockStart       = blockStart,
+            BlockExpire      = blockExpire,
+            RandomNum        = math.random(1, 100),
+            LastExecuteTime  = 0,
+            Config           = attackConfig,
+            Character        = TargetCharacter,
+        }
     end
 
-    -- Custom ParryFunction (e.g. Boxing M2)
-    if type(config.ParryFunction) == "function" then
-        scheduledMap[key] = true
-        local regData = { Processed = false, StartTime = animStart, Id = id }
-        pcall(function()
-            config.ParryFunction({
-                RegistryData = regData,
-                Mob = character,
-                AnimationId = id,
-            })
-        end)
+    local reg = AnimationRegistry[animKey]
+
+    -- Loop detection (TimePosition went backwards)
+    if reg.CurrentTrackTime and currentTrackTime < reg.CurrentTrackTime then
+        local blockStart, blockExpire = CalculateParryTiming(attackConfig, now - currentTrackTime, TargetCharacter)
+        reg.Processed       = false
+        reg.DidALoop        = true
+        reg.BlockStart      = blockStart
+        reg.BlockExpire     = blockExpire
+        reg.StartTime       = now - ConstLatency
+        reg.RandomNum       = math.random(1, 100)
+    end
+
+    reg.CurrentTrackTime = currentTrackTime
+    return reg
+end
+
+local function ExecuteParry(regData, attackConfig)
+    local now = os.clock()
+    if (now - (regData.LastExecuteTime or 0)) < EXECUTE_DEBOUNCE then
+        return
+    end
+    regData.LastExecuteTime = now
+
+    if LocalStunned then return end
+
+    local isHeavy = attackConfig.Heavy
+        or (tostring(attackConfig.DisplayName or ""):find("M2") ~= nil)
+        or (tostring(attackConfig.DisplayName or ""):find("Heavy") ~= nil)
+
+    -- ForceParry (Aikido / Wing Chun counters): always F, never Q
+    if attackConfig.ForceParry then
+        if LastPendingRegData ~= regData or regData.DidALoop then
+            LastPendingRegData = regData
+            regData.DidALoop = false
+            BlockStart(os.clock(), CFG.ParryHold)
+            parryCount = parryCount + 1
+            if CFG.SoundOnParry then
+                pcall(function()
+                    local s = Instance.new("Sound")
+                    s.SoundId = "rbxassetid://6026984224"
+                    s.Volume = 0.4
+                    s.Parent = game:GetService("SoundService")
+                    s:Play()
+                    game:GetService("Debris"):AddItem(s, 2)
+                end)
+            end
+            if CFG.Debug and UI_Library then
+                pcall(function()
+                    UI_Library:Notify("AP ForceParry",
+                        (attackConfig.Style or "?") .. " | " .. (attackConfig.DisplayName or "?"))
+                end)
+            end
+        end
         return
     end
 
-    scheduledMap[key] = true
-    table.insert(pendingParries, {
-        fireAt = fireAt,
-        windowEnd = windowEnd,
-        fired = false,
-        releaseAt = nil,
-        config = config,
-        id = id,
-        delay = math.max(0, fireAt - now),
-    })
+    if isHeavy and CFG.AutoDodge then
+        Dodge()
+        parryCount = parryCount + 1
+        return
+    end
+
+    if LastPendingRegData ~= regData or regData.DidALoop then
+        LastPendingRegData = regData
+        regData.DidALoop = false
+        BlockStart(os.clock(), CFG.ParryHold)
+        parryCount = parryCount + 1
+
+        if CFG.SoundOnParry then
+            pcall(function()
+                local s = Instance.new("Sound")
+                s.SoundId = "rbxassetid://6026984224"
+                s.Volume = 0.4
+                s.Parent = game:GetService("SoundService")
+                s:Play()
+                game:GetService("Debris"):AddItem(s, 2)
+            end)
+        end
+
+        if CFG.Debug and UI_Library then
+            pcall(function()
+                UI_Library:Notify("AP fired",
+                    (attackConfig.Style or "?") .. " | " .. (attackConfig.DisplayName or "?"))
+                print("[Olympus AP]", attackConfig.Style, attackConfig.DisplayName)
+            end)
+        end
+    end
+end
+
+-- Custom ParryFunction support (Boxing M2 etc.)
+local function TryParryFunction(regData, attackConfig, character, animId)
+    if type(attackConfig.ParryFunction) ~= "function" then return false end
+    local now = os.clock()
+    local rt = attackConfig.ReactionTime or attackConfig.ParryTime or DefaultRT
+    local window = tonumber(CFG.ParryWindow) or 0.20
+    if (now - regData.StartTime) <= (rt + window / 2) then
+        if not regData.Processed then
+            regData.Processed = true
+            pcall(function()
+                attackConfig.ParryFunction({
+                    RegistryData = regData,
+                    Mob = character,
+                    AnimationId = animId,
+                })
+            end)
+        end
+        return true
+    end
+    return false
 end
 
 -- ── AnimationTracker ─────────────────────────
@@ -1149,65 +1168,6 @@ local function getAnims(character)
     end
     return _animScratch
 end
-
--- ── Local Heavy / R ready timer ─────────────
-local heavyCdUntil = 0
-local heavyNotified = true          -- true = already notified (or never started)
-local lastLocalHeavyId = nil
-local lastLocalHeavySeen = 0
-
-local function isLocalHeavyAnim(animId)
-    local info = GameConfig[animId]
-    if not info then
-        -- try with rbxassetid prefix variants
-        if not tostring(animId):find("rbxassetid://", 1, true) then
-            info = GameConfig["rbxassetid://" .. tostring(animId)]
-        end
-    end
-    if not info then return false end
-    if info.Heavy then return true end
-    local n = tostring(info.DisplayName or "")
-    if n:find("M2") or n:find("Feint") or n:find("Heavy") or n:find("Momentum") then
-        return true
-    end
-    return false
-end
-
-local function tickHeavyReady(now)
-    if not CFG.HeavyReadyNotify then return end
-    local char = LocalPlayer.Character
-    if char then
-        local anims = getAnims(char)
-        for _, a in ipairs(anims) do
-            if a and a.id and isLocalHeavyAnim(a.id) then
-                -- new heavy press: only re-arm when id changes or enough time passed
-                if a.id ~= lastLocalHeavyId or (now - lastLocalHeavySeen) > 0.35 then
-                    lastLocalHeavyId = a.id
-                    lastLocalHeavySeen = now
-                    local cd = tonumber(CFG.HeavyCooldown) or 3.0
-                    heavyCdUntil = now + cd
-                    heavyNotified = false
-                    if CFG.Debug then
-                        pcall(function()
-                            UI_Library:Notify("Heavy CD", string.format("%.1fs", cd))
-                        end)
-                    end
-                else
-                    lastLocalHeavySeen = now
-                end
-                break
-            end
-        end
-    end
-    if not heavyNotified and heavyCdUntil > 0 and now >= heavyCdUntil then
-        heavyNotified = true
-        pcall(function()
-            UI_Library:Notify("Heavy Ready", "R / M2 is ready")
-        end)
-        print("[Olympus] Heavy Ready")
-    end
-end
-
 
 -- ── Rhythm Auto-Hit (was "Auto Play") ───────
 local Receptors = { Receptor1="X", Receptor2="C", Receptor3="N", Receptor4="M" }
@@ -1379,27 +1339,24 @@ pcall(function()
     end)
 end)
 
--- ── MAIN LOOP ───────────────────────────────
-local lastQueueTick  = 0
+-- ── MAIN LOOP (open-source continuous registry style) ──
 local lastDetectTick = 0
-local QUEUE_RATE     = 1/120  -- queue: 120Hz
-local DETECT_RATE    = 1/30   -- detection: 30Hz
-local HARD_RATE      = 1/120  -- hard callback cap (handles uncapped Heartbeat in Matcha)
+local DETECT_RATE    = 1/60   -- 60Hz evaluation (matches open-source continuous feel)
+local HARD_RATE      = 1/120
+local lastHardTick   = 0
 
 OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
     local now = os.clock()
-    -- hard gate: if Matcha runs Heartbeat uncapped (like RenderStepped), kill 80-90% of calls here
-    if (now - lastQueueTick) < HARD_RATE then return end
-    lastQueueTick = now
+    if (now - lastHardTick) < HARD_RATE then return end
+    lastHardTick = now
 
-    -- queue tick (every callback = 120Hz effective)
-    if #pendingParries > 0 then tickParryQueue() end
+    -- Auto-release F if hold expired (BlockHoldTime style)
+    if KeyHeld and ReleaseDeadline > 0 and now >= ReleaseDeadline then
+        BlockEnd()
+    end
 
-    if (now-lastDetectTick) < DETECT_RATE then return end
+    if (now - lastDetectTick) < DETECT_RATE then return end
     lastDetectTick = now
-
-    -- Local Heavy / R cooldown notify
-    tickHeavyReady(now)
 
     -- Local stun / parry state from anim lists
     do
@@ -1417,10 +1374,10 @@ OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
                         LocalParrying = true
                         if CurrentParryState == ParryState.INPUT_PENDING then
                             TransitionToState(ParryState.PARRYING)
+                            ParryRegisteredTime = now
                         end
                     end
                     if animSetHas(ParriedAnimation, a.id) or animSetHas(ParryFailedAnimation, a.id) then
-                        -- reset after resolved exchange
                         if CurrentParryState ~= ParryState.IDLE then
                             TransitionToState(ParryState.IDLE)
                         end
@@ -1428,27 +1385,23 @@ OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
                 end
             end
         end
-        -- Auto-release F if hold expired
-        if KeyHeld and ReleaseDeadline > 0 and now >= ReleaseDeadline then
-            BlockEnd()
-        end
     end
 
-    -- Rhythm Auto-Hit (note minigame)
+    -- Rhythm Auto-Hit
     if CFG.RhythmAutoHit then
         pcall(RhythmAutoHitTick)
     end
 
-    -- Auto-respawn check
+    -- Auto-respawn
     local respawnDelay = tonumber(CFG.RespawnDelay) or 1.5
-    if pendingRespawn and CFG.AutoRespawn and (now-pendingRespawn)>=respawnDelay then
+    if pendingRespawn and CFG.AutoRespawn and (now - pendingRespawn) >= respawnDelay then
         pendingRespawn = nil
         pcall(function() LocalPlayer:LoadCharacter() end)
     end
 
-    -- Anti-AFK ping
+    -- Anti-AFK
     local afkInterval = tonumber(CFG.AFKInterval) or 240
-    if CFG.AntiAFK and (now-lastAFKPing)>=afkInterval then
+    if CFG.AntiAFK and (now - lastAFKPing) >= afkInterval then
         lastAFKPing = now
         pcall(function()
             keypress(32)
@@ -1456,34 +1409,38 @@ OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
         end)
     end
 
-    if (now-lastCycle) >= 0.5 then
+    -- Target cycle + registry cleanup of dead keys
+    if (now - lastCycle) >= 0.5 then
         lastCycle = now
-        if next(scheduledMap) then table.clear(scheduledMap) end
         pcall(cycleTargets)
         if TargetLabel then
             pcall(function()
                 local names = {}
                 for _, ch in ipairs(TargetCharacters) do
-                    names[#names+1] = ch.Name
+                    names[#names + 1] = ch.Name
                 end
                 local pool = #names > 0 and table.concat(names, ", ") or "(none)"
-                TargetLabel:SetText("Locked: "..pool)
+                TargetLabel:SetText("Locked: " .. pool)
             end)
         end
     end
+
     if not CFG.Enabled then return end
     if not AnimTrackerInst then return end
     local lc = LocalPlayer.Character
     local lr = lc and lc:FindFirstChild("HumanoidRootPart")
     if not lr then return end
+
+    local currentActiveIds = {}
+
     for _, c in pairs(TargetCharacters) do
         local tr = c:FindFirstChild("HumanoidRootPart")
         if not tr then continue end
-        local dist = (lr.Position-tr.Position).Magnitude
+        local dist = (lr.Position - tr.Position).Magnitude
         if dist > CFG.APRange then continue end
-        -- ── Facing conditions ─────────────────────
+
+        -- Facing conditions
         if CFG.TargetFacingYou or CFG.YouFacingTarget then
-            -- pcall: Vector3 ops crash in Matcha when character is mid-respawn
             local passedFacing = true
             pcall(function()
                 local threshold  = tonumber(CFG.FacingThreshold) or 0.5
@@ -1491,10 +1448,9 @@ OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
                 local myLook     = lr.CFrame.LookVector
                 local diff       = lr.Position - tr.Position
                 local mag        = diff.Magnitude
-                if mag < 0.001 then return end  -- same position, skip
-                local toPlayer = diff / mag      -- normalize manually, avoids nan on zero vec
+                if mag < 0.001 then return end
+                local toPlayer = diff / mag
                 local toTarget = -toPlayer
-
                 if CFG.TargetFacingYou then
                     if targetLook:Dot(toPlayer) < threshold then
                         passedFacing = false
@@ -1510,25 +1466,67 @@ OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
         end
 
         local anims = getAnims(c)
-        if CFG.Debug and (now-debugLastPrint) > 2 then
+        if CFG.Debug and (now - debugLastPrint) > 2 then
             debugLastPrint = now
-            print("[Olympus DEBUG] targets="..#TargetCharacters..
-                " anims="..#anims.." dist="..math.floor(dist).." queue="..#pendingParries)
+            print("[Olympus DEBUG] targets=" .. #TargetCharacters ..
+                " anims=" .. #anims .. " dist=" .. math.floor(dist) ..
+                " registry=" .. (function()
+                    local n = 0
+                    for _ in pairs(AnimationRegistry) do n = n + 1 end
+                    return n
+                end)())
             for _, a in pairs(anims) do
-                print("  "..a.id.." inDB="..tostring(GameConfig[a.id]~=nil).." pos="..a.pos)
+                print("  " .. a.id .. " inDB=" .. tostring(GameConfig[a.id] ~= nil) .. " pos=" .. a.pos)
             end
         end
+
         for _, anim in pairs(anims) do
             local config = GameConfig[anim.id]
             if not config then
                 if CFG.Debug and not UnknownLog[anim.id] then
                     UnknownLog[anim.id] = true
                     local num = anim.id:match("%d+$") or anim.id:match("%d+")
-                    if num then table.insert(UnknownOrder,num) print("[Olympus UNKNOWN]",anim.id) end
+                    if num then
+                        table.insert(UnknownOrder, num)
+                        print("[Olympus UNKNOWN]", anim.id)
+                    end
                 end
                 continue
             end
-            queueParry(anim.id, anim.pos, config, c)
+
+            -- Stable key per character + anim id (open-source uses Address; we use Name+id)
+            local animKey = tostring(c) .. "|" .. tostring(anim.id)
+            currentActiveIds[animKey] = true
+
+            local regData = UpdateAnimationRegistry(animKey, anim.id, now, anim.pos or 0, config, c)
+            if regData.Processed then continue end
+
+            -- Probability gate (once per registry entry)
+            local prob = tonumber(CFG.ProbabilityToParry) or 100
+            if regData.RandomNum > prob then
+                regData.Processed = true
+                continue
+            end
+
+            -- Custom ParryFunction (Boxing M2 etc.)
+            if TryParryFunction(regData, config, c, anim.id) then
+                continue
+            end
+
+            -- Continuous window check (the core of open-source reliability)
+            if now >= regData.BlockStart and now <= regData.BlockExpire then
+                ExecuteParry(regData, config)
+            end
+        end
+    end
+
+    -- Cleanup registry entries whose animations stopped
+    for key, val in pairs(AnimationRegistry) do
+        if not currentActiveIds[key] then
+            if LastPendingRegData == val then
+                LastPendingRegData = nil
+            end
+            AnimationRegistry[key] = nil
         end
     end
 end))
@@ -1543,7 +1541,7 @@ end
 
 local UIRefs = {
     Armed=nil,AutoDodge=nil,MultiTarget=nil,Debug=nil,
-    CycleRange=nil,APRange=nil,ParryOffset=nil,ParryHold=nil,ParryCD=nil,
+    CycleRange=nil,APRange=nil,ParryOffset=nil,ParryHold=nil,
     TargetFacingYou=nil,YouFacingTarget=nil,FacingThreshold=nil,
     AntiAFK=nil,AFKInterval=nil,AutoRespawn=nil,RespawnDelay=nil,
 }
@@ -1679,7 +1677,6 @@ local function applySettings(s)
     if s.ParryOffset ~=nil then CFG.ParryOffset=s.ParryOffset setSlider(UIRefs.ParryOffset,s.ParryOffset) end
     if s.ParryHold         then CFG.ParryHold=s.ParryHold     setSlider(UIRefs.ParryHold,s.ParryHold) end
     if s.ParryWindow       then CFG.ParryWindow=s.ParryWindow setSlider(UIRefs.ParryWindow,s.ParryWindow) end
-    if s.ParryCD           then PARRY_CD=s.ParryCD            setSlider(UIRefs.ParryCD,s.ParryCD) end
     if s.ProbabilityToParry then CFG.ProbabilityToParry=s.ProbabilityToParry setSlider(UIRefs.ProbabilityToParry,s.ProbabilityToParry) end
     if s.PingCompensate  ~=nil then CFG.PingCompensate=s.PingCompensate setToggle(UIRefs.PingCompensate,s.PingCompensate) end
     if s.AutoTargetNearest~=nil then CFG.AutoTargetNearest=s.AutoTargetNearest setToggle(UIRefs.AutoTargetNearest,s.AutoTargetNearest) end
@@ -1690,8 +1687,6 @@ local function applySettings(s)
     if s.FacingThreshold       then CFG.FacingThreshold=s.FacingThreshold  setSlider(UIRefs.FacingThreshold,s.FacingThreshold) end
     -- misc
     if s.SoundOnParry    ~=nil then CFG.SoundOnParry=s.SoundOnParry end
-    if s.HeavyReadyNotify~=nil then CFG.HeavyReadyNotify=s.HeavyReadyNotify setToggle(UIRefs.HeavyReadyNotify,s.HeavyReadyNotify) end
-    if s.HeavyCooldown          then CFG.HeavyCooldown=s.HeavyCooldown     setSlider(UIRefs.HeavyCooldown,s.HeavyCooldown) end
     if s.AntiAFK         ~=nil then CFG.AntiAFK=s.AntiAFK                 setToggle(UIRefs.AntiAFK,s.AntiAFK) end
     if s.AFKInterval           then CFG.AFKInterval=s.AFKInterval           setSlider(UIRefs.AFKInterval,s.AFKInterval) end
     if s.AutoRespawn     ~=nil then CFG.AutoRespawn=s.AutoRespawn          setToggle(UIRefs.AutoRespawn,s.AutoRespawn) end
@@ -1743,13 +1738,12 @@ ProfilesSec:Button("Save Current",function()
             -- ranges + timing
             CycleRange=CFG.CycleRange, APRange=CFG.APRange,
             ParryOffset=CFG.ParryOffset, ParryHold=CFG.ParryHold, ParryWindow=CFG.ParryWindow,
-            ParryCD=PARRY_CD, ProbabilityToParry=CFG.ProbabilityToParry,
+            ProbabilityToParry=CFG.ProbabilityToParry,
             PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
             RhythmAutoHit=CFG.RhythmAutoHit,
             DefaultRT=DefaultRT, APKeybind=CFG.APKeybind,
             -- misc
             SoundOnParry=CFG.SoundOnParry,
-            HeavyReadyNotify=CFG.HeavyReadyNotify, HeavyCooldown=CFG.HeavyCooldown,
             AntiAFK=CFG.AntiAFK, AFKInterval=CFG.AFKInterval,
             AutoRespawn=CFG.AutoRespawn, RespawnDelay=CFG.RespawnDelay,
             -- compat
@@ -1824,96 +1818,49 @@ end)
 
 -- Armed
 ArmedSec:Info("Auto-targets nearby players every 0.5s")
-local APToggleElement = ArmedSec:Toggle("Auto Parry",true,function(v) CFG.Enabled=v end)
--- Keybind is for DISPLAY + REBIND only. Arming is handled by our InputBegan
--- (library "Toggle" mode only worked reliably for default G for some users).
-APKeybindRef = nil
-pcall(function()
-    -- Try callback-style first (updates CFG when user rebinds)
-    APKeybindRef = APToggleElement:AddKeybind("g", function(v)
-        if type(v) == "string" and #v > 0 and v:lower() ~= "none" then
-            CFG.APKeybind = v
-        elseif v ~= nil then
-            local n = tostring(v):match("KeyCode%.(.+)$") or tostring(v)
-            if n and n ~= "" then CFG.APKeybind = n end
-        end
-    end)
-end)
-if not APKeybindRef then
-    pcall(function()
-        APKeybindRef = APToggleElement:AddKeybind("g", "Hold")
-    end)
-end
-if not APKeybindRef then
-    pcall(function()
-        APKeybindRef = APToggleElement:AddKeybind("g", "Always")
-    end)
-end
-pcall(function()
-    local row = APKeybindRef or APToggleElement
-    if not row then return end
-    if row.OnChanged then
-        row.OnChanged:Connect(function(v)
-            if type(v) == "string" and #v > 0 then CFG.APKeybind = v end
-        end)
-    end
+-- ── AP arm toggle + INS keybind pill (Toggle mode) ──
+-- Pill sits next to the ON/OFF switch. Left-click pill = rebind, right-click = mode.
+local APToggleElement = ArmedSec:Toggle("Auto Parry", true, function(v)
+    CFG.Enabled = v and true or false
 end)
 UIRefs.Armed = APToggleElement
-UIRefs.AutoDodge = ArmedSec:Toggle("Auto Dodge Heavy",true,function(v) CFG.AutoDodge=v end)
-UIRefs.MultiTarget = ArmedSec:Toggle("Multiple Targets",true,function(v) CFG.MultiTarget=v end)
-UIRefs.AutoTargetNearest = ArmedSec:Toggle("Auto Target Nearest",true,function(v) CFG.AutoTargetNearest=v end)
+
+local APKeybindObj = nil
+pcall(function()
+    APKeybindObj = APToggleElement:AddKeybind(CFG.APKeybind or "g", "Toggle")
+end)
+
+UIRefs.AutoDodge = ArmedSec:Toggle("Auto Dodge Heavy", true, function(v) CFG.AutoDodge = v end)
+UIRefs.MultiTarget = ArmedSec:Toggle("Multiple Targets", true, function(v) CFG.MultiTarget = v end)
+UIRefs.AutoTargetNearest = ArmedSec:Toggle("Auto Target Nearest", true, function(v) CFG.AutoTargetNearest = v end)
 
 readAPKeybind = function()
-    local row = APKeybindRef or APToggleElement
-    if not row then return CFG.APKeybind or "g" end
-
-    local function normalize(v)
-        if v == nil then return nil end
-        if type(v) == "string" then
-            v = v:gsub("%s+", "")
-            if #v > 0 and v:lower() ~= "none" then return v end
-            return nil
-        end
-        -- Enum.KeyCode.X
-        if typeof and typeof(v) == "EnumItem" then
-            local n = tostring(v):match("KeyCode%.(.+)$")
-            if n then return n end
-        end
-        local n = tostring(v)
-        local short = n:match("KeyCode%.(.+)$")
-        if short then return short end
-        return nil
-    end
-
-    local bind = rawget(row, "Bind")
-    if type(bind) == "table" then
-        for _, prop in pairs({"Value", "Key", "CurrentKey", "Keybind", "Code"}) do
-            local n = normalize(rawget(bind, prop))
-            if n then CFG.APKeybind = n return n end
-        end
-    end
-    for _, prop in pairs({"Key", "CurrentKey", "Keybind", "Value", "CurrentKeybind", "Bind"}) do
-        local n = normalize(rawget(row, prop))
-        if n then CFG.APKeybind = n return n end
-    end
-    -- deep search common INS layouts
+    local k = nil
     pcall(function()
-        if row.Get then
-            local n = normalize(row:Get())
-            if n then CFG.APKeybind = n end
+        if APKeybindObj then
+            if type(APKeybindObj.Get) == "function" then k = APKeybindObj:Get()
+            elseif APKeybindObj.Value then k = APKeybindObj.Value
+            elseif APKeybindObj.Key then k = APKeybindObj.Key
+            end
         end
     end)
-    return CFG.APKeybind or "g"
+    if type(k) ~= "string" or #k == 0 then k = CFG.APKeybind or "g" end
+    return tostring(k)
 end
 
 writeAPKeybind = function(key)
-    if not key or key=="" then return end
-    CFG.APKeybind = key
-    local row = APKeybindRef or APToggleElement
-    if not row then return end
-    local bind = rawget(row,"Bind")
-    if type(bind)=="table" then bind.Value=key return end
-    pcall(function() if row.Set then row:Set(key) end end)
+    if not key or key == "" then return end
+    local s = tostring(key):gsub("%s+", "")
+    if s == "" then return end
+    CFG.APKeybind = s
+    pcall(function()
+        if APKeybindObj then
+            if type(APKeybindObj.Set) == "function" then APKeybindObj:Set(s)
+            elseif type(APKeybindObj.SetKey) == "function" then APKeybindObj:SetKey(s)
+            elseif APKeybindObj.Value ~= nil then APKeybindObj.Value = s
+            end
+        end
+    end)
 end
 
 CondSec:Info("Gate parry per target based on facing direction")
@@ -1943,14 +1890,12 @@ UIRefs.ParryHold = EngineSec:Slider("Parry Hold",0.27,0.001,0.05,0.8,"s",functio
 UIRefs.ParryHold:Set(0.27)
 UIRefs.ParryWindow = EngineSec:Slider("Parry Window",0.20,0.001,0,1,"s",function(v) CFG.ParryWindow=tonumber(v) or 0.20 end)
 UIRefs.ParryWindow:Set(0.20)
-UIRefs.ParryCD = EngineSec:Slider("Parry CD",0.05,0.001,0,1,"s",function(v) PARRY_CD=tonumber(v) or 0.05 end)
-UIRefs.ParryCD:Set(0.05)
 UIRefs.ProbabilityToParry = EngineSec:Slider("Probability To Parry",100,1,1,100,"%",function(v) CFG.ProbabilityToParry=tonumber(v) or 100 end)
 UIRefs.ProbabilityToParry:Set(100)
 UIRefs.PingCompensate = EngineSec:Toggle("Ping Compensation", true, function(v) CFG.PingCompensate=v end)
 EngineSec:Info("Ping Comp subtracts half your ping from reaction time.")
 EngineSec:Info("Window = how long after ideal fire time a parry is still accepted.")
-EngineSec:Info("CD = min gap between parries.")
+EngineSec:Info("v9.4 uses open-source continuous registry (no global CD).")
 
 DebugSec:Label("Enable Debug Parry to see prints + notifs")
 DebugSec:Button("Copy Unknown IDs",function()
@@ -1962,9 +1907,10 @@ DebugSec:Button("Clear Unknown Log",function()
     table.clear(UnknownLog) table.clear(UnknownOrder)
     UI_Library:Notify("Debug","Cleared")
 end)
-DebugSec:Button("Flush Parry Queue",function()
-    table.clear(pendingParries) table.clear(scheduledMap)
-    UI_Library:Notify("Debug","Queue flushed")
+DebugSec:Button("Flush Registry",function()
+    table.clear(AnimationRegistry)
+    LastPendingRegData = nil
+    UI_Library:Notify("Debug","Registry flushed")
 end)
 
 -- ── Timings Tab ──────────────────────────────
@@ -2097,18 +2043,6 @@ MiscSec:Toggle("Sound on Parry",false,function(v)
     CFG.SoundOnParry=v
 end)
 MiscSec:Info("Plays a click sound each time F is pressed")
-UIRefs.HeavyReadyNotify = MiscSec:Toggle("Heavy Ready Notify", true, function(v)
-    CFG.HeavyReadyNotify = v
-    if not v then
-        heavyNotified = true
-        heavyCdUntil = 0
-    end
-end)
-UIRefs.HeavyCooldown = MiscSec:Slider("Heavy Cooldown", 3.0, 0.1, 0.5, 10, "s", function(v)
-    CFG.HeavyCooldown = tonumber(v) or 3.0
-end)
-UIRefs.HeavyCooldown:Set(3.0)
-MiscSec:Info("Tracks YOUR M2/R anim, then notifies when the timer ends")
 UIRefs.RhythmAutoHit = MiscSec:Toggle("Rhythm Auto-Hit", false, function(v)
     CFG.RhythmAutoHit = v
     UI_Library:Notify("Rhythm Auto-Hit", v and "ON — note minigame keys" or "OFF")
@@ -2194,92 +2128,23 @@ SoonSec:Label("Profile Quick-Switch keybind")
 SoonSec:Divider("Credit")
 SoonSec:Info("Made By Fgonzxlez")
 
+-- INS UI drives the AP toggle via the keybind pill (Toggle mode).
+-- No custom InputBegan needed for arming — the library handles it.
+-- RightShift still toggles menu visibility if the lib doesn't already.
 local UIS = game:GetService("UserInputService")
-
-local function keyStringToKeyCode(s)
-    if s == nil then return nil end
-    s = tostring(s):gsub("%s+", "")
-    if s == "" or s:lower() == "none" then return nil end
-    -- Enum name: "LeftShift", "G", "One", ...
-    local ok, kc = pcall(function() return Enum.KeyCode[s] end)
-    if ok and typeof(kc) == "EnumItem" then return kc end
-    ok, kc = pcall(function() return Enum.KeyCode[s:upper()] end)
-    if ok and typeof(kc) == "EnumItem" then return kc end
-    ok, kc = pcall(function() return Enum.KeyCode[s:lower()] end)
-    if ok and typeof(kc) == "EnumItem" then return kc end
-    -- single character
-    if #s == 1 then
-        ok, kc = pcall(function() return Enum.KeyCode[s:upper()] end)
-        if ok and typeof(kc) == "EnumItem" then return kc end
-    end
-    return nil
-end
-
-local function keyCodeToString(kc)
-    if not kc then return nil end
-    local n = tostring(kc)
-    -- Enum.KeyCode.G -> G
-    local short = n:match("KeyCode%.(.+)$") or n
-    return short
-end
-
-local function syncKeybindFromUI()
-    local k = nil
-    pcall(function()
-        if readAPKeybind then k = readAPKeybind() end
-    end)
-    if type(k) == "string" and #k > 0 and k:lower() ~= "none" then
-        CFG.APKeybind = k
-    end
-end
-
-local function setArmed(state)
-    CFG.Enabled = state and true or false
-    pcall(function()
-        if UIRefs and UIRefs.Armed and UIRefs.Armed.Set then
-            UIRefs.Armed:Set(CFG.Enabled)
-        end
-    end)
-    pcall(function()
-        if UI_Library and UI_Library.Notify then
-            UI_Library:Notify("Auto Parry", CFG.Enabled and "ARMED" or "DISARMED")
-        end
-    end)
-end
-
 OlympusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
     if not OlympusState.Alive then return end
     if gpe then return end
-
-    -- Menu toggle
-    if inp.KeyCode == Enum.KeyCode.RightShift then
+    if inp.UserInputType == Enum.UserInputType.Keyboard
+        and inp.KeyCode == Enum.KeyCode.RightShift then
         menuOpen = not menuOpen
-        return
-    end
-
-    -- Only keyboard for AP arm keybind
-    if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
-
-    -- Pull latest key from UI so rebinds stick
-    syncKeybindFromUI()
-    local want = keyStringToKeyCode(CFG.APKeybind or "g")
-    if not want then
-        want = Enum.KeyCode.G
-    end
-
-    if inp.KeyCode == want then
-        local t = os.clock()
-        if (t - (OlympusState._lastArmToggle or 0)) < 0.2 then return end
-        OlympusState._lastArmToggle = t
-        setArmed(not CFG.Enabled)
     end
 end))
-
 
 refreshDrop()
 setMenuInput(false)
 pcall(function() setrobloxinput(true) end)
 
 pcall(function() OlympusState.UI_Window = UI_Window end)
-UI_Library:Notify("Olympus","v9.3.1 | RightShift (0.001 timing steps) = close menu")
-print("[Olympus v9.3.1] loaded — AutoDodge gate + reliable AP keybind — ping/window/prob/ParryFunction/IgnoreIds/state/rhythm — Heavy Ready notify — Striker unique labels — full Striker anim sets — config save uses selected profile — Aikido M2 ForceParry — timing sliders step 0.001 — PerfectCopy/Aikido/Taijutsu/Giovanna/Hikaken + Kyokushin M2")
+UI_Library:Notify("Olympus","v9.4 | INS keybind pill (Toggle) + open-source registry")
+print("[Olympus v9.4] loaded — open-source AnimationRegistry + ConstLatency + continuous window — INS AddKeybind pill on AP toggle (Toggle mode) — no Set Keybind button — Heavy Ready removed — no global PARRY_CD — profiles / styles / ForceParry / Rhythm intact")
