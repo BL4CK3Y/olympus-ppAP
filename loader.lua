@@ -1,5 +1,5 @@
 -- Olympus AP loader
-local SCRIPT_URL = "https://raw.githubusercontent.com/BL4CK3Y/olympus-ppAP/main/olympus.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/BL4CK3Y/syndicatusAP/main/syndicatus.lua"
 
 local ok, err = pcall(function()
     local src = game:HttpGet(SCRIPT_URL)
