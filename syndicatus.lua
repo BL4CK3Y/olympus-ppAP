@@ -1,73 +1,3 @@
--- =============================================
--- Syndicatus Auto Parry — v9.4.3 base, rebranded in v9.4.8
--- (lineage history retains the Olympus name on versions where that was its name)
--- =============================================
---
--- Original name: Olympus Auto Parry — v9.4.3
--- + Open-source registry + continuous window (lolbeans style)
--- + ConstLatency start-time, loop re-arm, consistent PARRYING
--- + Ping compensation, Parry Window, Probability
--- + ParryFunction, IgnoreIds, state anim lists
--- + Auto Target Nearest, Rhythm Auto-Hit
--- + BlockStart/BlockEnd, cleanup on re-inject
--- - Heavy Ready removed (was inaccurate)
--- - Global PARRY_CD removed (per-anim EXECUTE_DEBOUNCE instead)
--- v9.4.2 cleanup pass (zero AP delta):
---   * forward-declared BlockStart/BlockEnd/Dodge (de-leaked from _G)
---   * local RhythmAutoHitTick, removed dead _defer + _origCycle + PlayersSvc fallback
---   * ping cache @ 10Hz, height cache (weak-keyed per character)
---   * IsHeavy helper, facing-dot pcall unwrap (pure math, cannot throw)
---   * ipairs on Lanes, rhythm KeyByte precache, hoisted tostring(char) in anim loop
---   * cycleTargets arrays hoisted to module locals
---   * applySettings now persists AutoHeight + HeightInfluence; FacingThreshold = 0 now loads
---   * UnknownLog capped at 500 entries
--- v9.4.3:
---   Menu: restored INS animations + drag smoothness (dropped SetPerformance(true), reduced theme-reapply stacking)
---   AP consistency (silent, always-on — no UI toggles):
---     * Live BlockStart recompute per-frame — tracks ping drift during attack windup
---     * Movement bias: horizontal velocity > 20 studs/s shifts fire-point ~15ms earlier
---     * Ping-jitter window expansion (bounded ±25ms shift / +50ms window max)
---     * Local anim-state scan moved to Heartbeat (RS no longer processes own-char anims)
---     * Early-exit RS AP eval on LocalStunned (skips entire target+anim loop when stunned)
---   Config sharing: Export to Clipboard / Import from Clipboard / Import from URL (Profiles tab)
--- v9.4.4 FPS pass (zero AP delta):
---   * Menu auto-perf: tweens OFF when menu hidden (RightShift), ON when visible. You get animations
---     when you're looking, zero INS overhead during fights.
---   * Live BlockStart recompute throttled to every 3rd RS frame (~12ms refresh at 240Hz,
---     well inside ParryWindow tolerance — ping drift still tracked, 2/3 fewer CalculateParryTiming calls)
---   * cycleTargets sort comparator hoisted to module-local (no closure realloc per 2Hz tick)
---   * HB local anim scan early-exits when CFG.Enabled is false (one less matcha Update/HB while disarmed)
--- v9.4.5 feature pack (Techs tab + Visuals section):
---   * Anti Feint — releases F early when attack cancels before parry registers
---   * Crit Defense — randomizes F/Q 50/50 on Heavy/M2 attacks (overrides AutoDodge when on)
---   * Wing Chun Fake Wiff — rotates away + fires M1 to bait WC M2 counter whiff
---   * Shadow Step (Z) / Shadow Crit (B) — rapid F+Q taps on hotkey
---   * Personal HP — compact health bar at screen bottom
---   * Opponent HP — billboard bars over nearby players (gated by HP View Range)
---   * Low Lag Mode — suppresses visual overlays when on
--- v9.4.6 fix pass:
---   * Personal + Opponent HP: parent to gethui()/CoreGui proxy (survives game sanitization)
---     + protect_gui calls where executor supports it
---   * ParryHold + ParryWindow sliders REMOVED — hard-locked to source defaults
---     (Hold=0.27s, Window=0.20s). Legacy save profiles can no longer override these.
--- v9.4.7 strip pass:
---   * Visuals section fully removed (Personal HP, Opponent HP, HP View Range, Low Lag Mode)
---     game has native HP displays — redundant surface area, zero benefit
---   * Performance section removed (Low Lag only gated HP — nothing left to gate)
---   * Facing Threshold slider removed — hard-locked to source default 0.1
---     (source constant, not a tunable; exposing it caused "AP broken" reports)
---   * All related CFG keys, applySettings branches, save payload entries purged
--- v9.4.8 rebrand:
---   * Olympus → Syndicatus everywhere (UI title, notifies, print tags, internal identifiers)
---   * _G.__OlympusAP → _G.__SyndicatusAP (legacy key also cleaned on upgrade)
---   * PROFILE_FOLDER "Olympus" → "Syndicatus" (NOTE: old profiles stay in Olympus/ folder;
---     move them manually or re-save under the new name)
---   * INS config autosave key renamed (menu layout resets once on upgrade — one-time)
---   * External GitHub asset URL kept as-is (not ours)
---   * Share format tag updated; import still accepts legacy "olympus-share-v1"
--- =============================================
-
--- Cleanup previous inject — handle both the new _G key and the legacy one (v9.4.7 and earlier)
 pcall(function()
     if _G.__SyndicatusAP and _G.__SyndicatusAP.Cleanup then
         _G.__SyndicatusAP:Cleanup()
@@ -871,7 +801,7 @@ end
 
 -- ── Multi-Config ────────────────────────────
 local PROFILE_FOLDER = "Syndicatus"
-local LEGACY_PROFILE_FOLDER = "Olympus"  -- v9.4.8: fallback for pre-rebrand saves
+local LEGACY_PROFILE_FOLDER = "Syndicates"  -- v9.4.8: fallback for pre-rebrand saves
 local GAKURAN_FOLDER = "GakuranConfigs"
 local profileSourceMap = {}
 
@@ -1980,7 +1910,7 @@ applyDarkTheme()
 
 -- Menu background — INS draws this ABOVE section cards (z ~119999).
 -- High alpha = grey wash over everything. Keep low so black panels read solid.
-local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/olympus-ppAP/main/content.png"
+local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/syndicatusAP/main/content.png"
 local function applyMenuBackground()
     pcall(function()
         if UI_Library and UI_Library.SetBackgroundImage then
