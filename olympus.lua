@@ -1,6 +1,5 @@
-
 -- =============================================
--- Olympus Auto Parry — v9.4
+-- Olympus Auto Parry — v9.4.3
 -- + Open-source registry + continuous window (lolbeans style)
 -- + ConstLatency start-time, loop re-arm, consistent PARRYING
 -- + Ping compensation, Parry Window, Probability
@@ -9,6 +8,39 @@
 -- + BlockStart/BlockEnd, cleanup on re-inject
 -- - Heavy Ready removed (was inaccurate)
 -- - Global PARRY_CD removed (per-anim EXECUTE_DEBOUNCE instead)
+-- v9.4.2 cleanup pass (zero AP delta):
+--   * forward-declared BlockStart/BlockEnd/Dodge (de-leaked from _G)
+--   * local RhythmAutoHitTick, removed dead _defer + _origCycle + PlayersSvc fallback
+--   * ping cache @ 10Hz, height cache (weak-keyed per character)
+--   * IsHeavy helper, facing-dot pcall unwrap (pure math, cannot throw)
+--   * ipairs on Lanes, rhythm KeyByte precache, hoisted tostring(char) in anim loop
+--   * cycleTargets arrays hoisted to module locals
+--   * applySettings now persists AutoHeight + HeightInfluence; FacingThreshold = 0 now loads
+--   * UnknownLog capped at 500 entries
+-- v9.4.3:
+--   Menu: restored INS animations + drag smoothness (dropped SetPerformance(true), reduced theme-reapply stacking)
+--   AP consistency (silent, always-on — no UI toggles):
+--     * Live BlockStart recompute per-frame — tracks ping drift during attack windup
+--     * Movement bias: horizontal velocity > 20 studs/s shifts fire-point ~15ms earlier
+--     * Ping-jitter window expansion (bounded ±25ms shift / +50ms window max)
+--     * Local anim-state scan moved to Heartbeat (RS no longer processes own-char anims)
+--     * Early-exit RS AP eval on LocalStunned (skips entire target+anim loop when stunned)
+--   Config sharing: Export to Clipboard / Import from Clipboard / Import from URL (Profiles tab)
+-- v9.4.4 FPS pass (zero AP delta):
+--   * Menu auto-perf: tweens OFF when menu hidden (RightShift), ON when visible. You get animations
+--     when you're looking, zero INS overhead during fights.
+--   * Live BlockStart recompute throttled to every 3rd RS frame (~12ms refresh at 240Hz,
+--     well inside ParryWindow tolerance — ping drift still tracked, 2/3 fewer CalculateParryTiming calls)
+--   * cycleTargets sort comparator hoisted to module-local (no closure realloc per 2Hz tick)
+--   * HB local anim scan early-exits when CFG.Enabled is false (one less matcha Update/HB while disarmed)
+-- v9.4.5 feature pack (Techs tab + Visuals section):
+--   * Anti Feint — releases F early when attack cancels before parry registers
+--   * Crit Defense — randomizes F/Q 50/50 on Heavy/M2 attacks (overrides AutoDodge when on)
+--   * Wing Chun Fake Wiff — rotates away + fires M1 to bait WC M2 counter whiff
+--   * Shadow Step (Z) / Shadow Crit (B) — rapid F+Q taps on hotkey
+--   * Personal HP — compact health bar at screen bottom
+--   * Opponent HP — billboard bars over nearby players (gated by HP View Range)
+--   * Low Lag Mode — suppresses visual overlays when on
 -- =============================================
 
 -- Cleanup previous inject
@@ -17,6 +49,10 @@ pcall(function()
         _G.__OlympusAP:Cleanup()
     end
 end)
+
+-- v9.4.5 — forward-declare HP teardown functions BEFORE OlympusState:Cleanup definition
+-- so the Cleanup body binds to this local slot (not _ENV globals, which would be nil forever).
+local cleanupPersonalHP, clearAllOpponentHPBars
 
 local OlympusState = {
     Alive = true,
@@ -31,10 +67,17 @@ end
 
 function OlympusState:Cleanup()
     self.Alive = false
-    for _, c in ipairs(self.Connections or {}) do
-        pcall(function() c:Disconnect() end)
+    if self.Connections then
+        for _, c in ipairs(self.Connections) do
+            pcall(function() c:Disconnect() end)
+        end
+        table.clear(self.Connections)
     end
-    table.clear(self.Connections or {})
+    -- v9.4.5 — tear down HP GUIs on unload
+    pcall(function()
+        if cleanupPersonalHP then cleanupPersonalHP() end
+        if clearAllOpponentHPBars then clearAllOpponentHPBars() end
+    end)
     pcall(function()
         if self.UI_Window and self.UI_Window.Destroy then
             self.UI_Window:Destroy()
@@ -48,20 +91,12 @@ local RunService  = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local PlayersSvc  = game:GetService("Players")
 local StatsSvc    = game:GetService("Stats")
-if not PlayersSvc then PlayersSvc = game.Players end
-if not PlayersSvc then
-    warn("[Olympus] FATAL: cannot get PlayersSvc service. Are you in a game?")
-    return
-end
 
 local LocalPlayer = PlayersSvc.LocalPlayer
 if not LocalPlayer then LocalPlayer = PlayersSvc.PlayerAdded:Wait() end
 
-local function _defer(fn)
-    if task and task.defer then task.defer(fn)
-    elseif task and task.spawn then task.spawn(fn)
-    else pcall(fn) end
-end
+-- Forward-declare AP primitives so BoxingM2 ParryFunction closure (in GameConfig below) captures the local slot
+local BlockStart, BlockEnd, Dodge
 
 -- ── Utilities ──
 pcall(function()
@@ -911,6 +946,14 @@ local CFG = {
     AutoRespawn=false, RespawnDelay=1.5,
     TargetFacingYou=false, YouFacingTarget=true,
     FacingThreshold=0.1,  -- matches open-source (0.1); 0.5 ≈ 60° cone
+    -- v9.4.5 feature pack
+    AntiFeint=false,
+    CritDefense=false,
+    WCFakeWiff=false, WCFakeWiffTime=0.18,
+    ShadowStep=false, ShadowCrit=false,
+    PersonalHP=false,
+    OpponentHP=false, HPViewRange=75,
+    LowLagMode=false,
 }
 
 local ParryKey = string.byte("F")
@@ -929,6 +972,48 @@ local function GetPingValue()
     end)
     if ok and type(v) == "number" then return v end
     return 50
+end
+
+-- 10Hz cache — refreshed on Heartbeat tick below. Worst-case fire-point drift
+-- from 100ms ping staleness is ~5ms, well inside default 200ms ParryWindow.
+local CachedPing = GetPingValue()
+local lastPingUpdate = 0
+local function GetCachedPing()
+    return CachedPing
+end
+
+-- ── v9.4.3 consistency package (silent, always-on) ──
+-- Ping jitter ring buffer: 20 samples @ 10Hz = 2s rolling window
+local PING_SAMPLE_COUNT = 20
+local pingSamples = table.create(PING_SAMPLE_COUNT, CachedPing)
+local pingSampleIdx = 1
+local pingJitter = 0  -- ms, max-min over window
+
+-- Movement bias (horizontal velocity-driven early-fire)
+-- > 20 studs/s (sprint-ish): -15ms. > 8 studs/s (walk): -8ms. Else 0.
+local cachedMovementBias = 0
+
+-- Height cache (weak-keyed per character — GC drops dead chars automatically).
+-- BodyHeightScale is set at spawn and does not change mid-fight in FFTM-style games.
+local heightCache = setmetatable({}, {__mode = "k"})
+local function heightScale(character)
+    if not character then return 1 end
+    local cached = heightCache[character]
+    if cached then return cached end
+    local hum = character:FindFirstChildWhichIsA("Humanoid")
+    if not hum then return 1 end
+    local scale = hum:FindFirstChild("BodyHeightScale")
+    local v = (scale and tonumber(scale.Value)) or 1
+    heightCache[character] = v
+    return v
+end
+
+-- Centralised heavy check — identical to the two previous inline copies
+local function IsHeavy(cfg)
+    return cfg.Heavy
+        or cfg.DisplayName == "M2"
+        or cfg.DisplayName == "Heavy"
+        or (tostring(cfg.DisplayName or ""):find("M2") ~= nil)
 end
 
 -- ── AP core — ported from lolbeans67 (identical timing / fire path) ──
@@ -995,12 +1080,267 @@ function Dodge(force)
     end)
 end
 
-local function heightScale(character)
-    local hum = character and character:FindFirstChildWhichIsA("Humanoid")
-    if not hum then return 1 end
-    local scale = hum:FindFirstChild("BodyHeightScale")
-    if scale and tonumber(scale.Value) then return tonumber(scale.Value) end
-    return 1
+-- ── v9.4.5 Shadow Step / Shadow Crit ──
+-- Rapid simultaneous F+Q taps. Z = Shadow Step (standalone), B = Shadow Crit (same mechanic,
+-- separately gated so you can bind them to different situations).
+local function doShadowSequence()
+    pcall(function()
+        for _ = 1, 3 do
+            keypress(ParryKey)
+            keypress(DodgeKey)
+            task.wait(0.02)
+            keyrelease(ParryKey)
+            keyrelease(DodgeKey)
+            task.wait(0.02)
+        end
+    end)
+end
+
+-- ── v9.4.5 Wing Chun Fake Wiff ──
+-- WC M2 is a counter — it whiffs if your M1 doesn't connect during their windup.
+-- We rotate away briefly, fire M1 into empty air, then restore facing. One-shot per registry entry.
+local WCFakeWiffActive = false
+local function doWCFakeWiff(targetChar)
+    if WCFakeWiffActive then return end
+    WCFakeWiffActive = true
+    task.spawn(function()
+        local ok = pcall(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            local targetHrp = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+            if not targetHrp then return end
+
+            local origCFrame = hrp.CFrame
+            -- Face directly away from target so M1 cone misses
+            local awayDir = (hrp.Position - targetHrp.Position)
+            if awayDir.Magnitude < 0.01 then return end
+            awayDir = awayDir.Unit
+            hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + awayDir * 10)
+
+            -- Fire M1 into empty air (bait their counter)
+            if mouse1click then mouse1click() end
+
+            task.wait(tonumber(CFG.WCFakeWiffTime) or 0.18)
+
+            -- Restore original facing
+            local lookTarget = hrp.Position + origCFrame.LookVector * 10
+            hrp.CFrame = CFrame.new(hrp.Position, lookTarget)
+        end)
+        if not ok and CFG.Debug then print("[Olympus] WC Fake Wiff failed") end
+        WCFakeWiffActive = false
+    end)
+end
+
+-- ── v9.4.5 Anti Feint state ──
+-- Tracks the regData we last fired on so we can detect its early disappearance (feint).
+local AntiFeintTarget = nil  -- regData reference
+local AntiFeintFireTime = 0
+
+-- ── v9.4.5 Personal HP bar ──
+local personalHPState = { gui = nil, connections = {} }
+
+function cleanupPersonalHP()
+    for _, c in ipairs(personalHPState.connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(personalHPState.connections)
+    if personalHPState.gui then
+        pcall(function() personalHPState.gui:Destroy() end)
+        personalHPState.gui = nil
+    end
+end
+
+local function buildPersonalHP()
+    cleanupPersonalHP()
+    local okBuild = pcall(function()
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "OlympusPersonalHP"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui", 5)
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(0, 220, 0, 14)
+        frame.Position = UDim2.new(0.5, -110, 1, -50)
+        frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        frame.BackgroundTransparency = 0.3
+        frame.BorderSizePixel = 0
+        frame.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 3)
+        corner.Parent = frame
+
+        local fill = Instance.new("Frame")
+        fill.Name = "Fill"
+        fill.Size = UDim2.new(1, 0, 1, 0)
+        fill.BackgroundColor3 = Color3.fromRGB(60, 180, 40)
+        fill.BorderSizePixel = 0
+        fill.Parent = frame
+
+        local fillCorner = Instance.new("UICorner")
+        fillCorner.CornerRadius = UDim.new(0, 3)
+        fillCorner.Parent = fill
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.BackgroundTransparency = 1
+        label.Text = "— / —"
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextStrokeTransparency = 0.4
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 11
+        label.ZIndex = 2
+        label.Parent = frame
+
+        personalHPState.gui = gui
+
+        local function hookHumanoid(hum)
+            if not hum then return end
+            local function refresh()
+                if not personalHPState.gui or not personalHPState.gui.Parent then return end
+                local hp = math.max(0, hum.Health)
+                local maxHp = math.max(1, hum.MaxHealth)
+                local ratio = math.clamp(hp / maxHp, 0, 1)
+                fill.Size = UDim2.new(ratio, 0, 1, 0)
+                fill.BackgroundColor3 = Color3.fromRGB(
+                    math.floor(210 * (1 - ratio) + 60 * ratio),
+                    math.floor(40 * (1 - ratio) + 180 * ratio),
+                    40
+                )
+                label.Text = string.format("%d / %d", math.floor(hp + 0.5), math.floor(maxHp + 0.5))
+            end
+            refresh()
+            table.insert(personalHPState.connections, hum.HealthChanged:Connect(refresh))
+            table.insert(personalHPState.connections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
+        end
+
+        local function onCharacter(char)
+            if not char then return end
+            local hum = char:FindFirstChildWhichIsA("Humanoid") or char:WaitForChild("Humanoid", 3)
+            hookHumanoid(hum)
+        end
+
+        if LocalPlayer.Character then onCharacter(LocalPlayer.Character) end
+        table.insert(personalHPState.connections, LocalPlayer.CharacterAdded:Connect(onCharacter))
+    end)
+    if not okBuild then cleanupPersonalHP() end
+end
+
+-- ── v9.4.5 Opponent HP bars ──
+local opponentHPBars = {}  -- [player] = { gui, fill, label }
+
+local function removeOpponentHPBar(player)
+    local b = opponentHPBars[player]
+    if b then
+        pcall(function() if b.gui then b.gui:Destroy() end end)
+        opponentHPBars[player] = nil
+    end
+end
+
+function clearAllOpponentHPBars()
+    for p, _ in pairs(opponentHPBars) do removeOpponentHPBar(p) end
+end
+
+local function ensureOpponentHPBar(player)
+    local existing = opponentHPBars[player]
+    if existing and existing.gui and existing.gui.Parent then return existing end
+    if existing then removeOpponentHPBar(player) end
+    local char = player.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildWhichIsA("Humanoid")
+    if not hrp or not hum then return nil end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "OlympusHP_" .. player.Name
+    billboard.Size = UDim2.new(0, 110, 0, 22)
+    billboard.StudsOffset = Vector3.new(0, 3.2, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Adornee = hrp
+    billboard.Parent = hrp
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 1, 0)
+    frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    frame.BackgroundTransparency = 0.4
+    frame.BorderSizePixel = 0
+    frame.Parent = billboard
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 3)
+    corner.Parent = frame
+
+    local fill = Instance.new("Frame")
+    fill.Name = "Fill"
+    fill.Size = UDim2.new(1, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(60, 180, 40)
+    fill.BorderSizePixel = 0
+    fill.Parent = frame
+
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(0, 3)
+    fillCorner.Parent = fill
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = player.Name
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextStrokeTransparency = 0.3
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 11
+    label.ZIndex = 2
+    label.Parent = frame
+
+    opponentHPBars[player] = { gui = billboard, fill = fill, label = label, hum = hum, hrp = hrp }
+    return opponentHPBars[player]
+end
+
+local function updateOpponentHPBars()
+    if not CFG.OpponentHP or CFG.LowLagMode then
+        if next(opponentHPBars) then clearAllOpponentHPBars() end
+        return
+    end
+    local lc = LocalPlayer.Character
+    local lr = lc and lc:FindFirstChild("HumanoidRootPart")
+    if not lr then clearAllOpponentHPBars() return end
+
+    local viewRange = tonumber(CFG.HPViewRange) or 75
+    local seen = {}
+    pcall(function()
+        for _, p in ipairs(PlayersSvc:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                local hum = p.Character:FindFirstChildWhichIsA("Humanoid")
+                if hrp and hum and hum.Health > 0 then
+                    local d = (lr.Position - hrp.Position).Magnitude
+                    if d <= viewRange then
+                        seen[p] = true
+                        local bar = ensureOpponentHPBar(p)
+                        if bar and bar.hum and bar.hum.Parent then
+                            local hp = math.max(0, bar.hum.Health)
+                            local maxHp = math.max(1, bar.hum.MaxHealth)
+                            local ratio = math.clamp(hp / maxHp, 0, 1)
+                            bar.fill.Size = UDim2.new(ratio, 0, 1, 0)
+                            bar.fill.BackgroundColor3 = Color3.fromRGB(
+                                math.floor(210 * (1 - ratio) + 60 * ratio),
+                                math.floor(40 * (1 - ratio) + 180 * ratio),
+                                40
+                            )
+                            bar.label.Text = string.format("%s  %d", p.Name, math.floor(hp + 0.5))
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    for p, _ in pairs(opponentHPBars) do
+        if not seen[p] then removeOpponentHPBar(p) end
+    end
 end
 
 -- Exact source formula:
@@ -1016,12 +1356,21 @@ local function CalculateParryTiming(attackConfig, StartTime, Target)
         HeightMultiplier = 1 + (s - 1) * inf
     end
     if CFG.PingCompensate then
-        local CompValue = (GetPingValue() / 1000) * 0.5
+        local CompValue = (GetCachedPing() / 1000) * 0.5
         optimalReactionTime = optimalReactionTime - CompValue
         if optimalReactionTime < 0 then optimalReactionTime = 0 end
     end
-    local adjustedReactionTime = (optimalReactionTime * HeightMultiplier) + (CFG.ParryOffset or 0)
-    local window = tonumber(CFG.ParryWindow) or 0.20
+    -- v9.4.3 consistency: pull BlockStart earlier by jitterShift, extend window by 2 * jitterShift.
+    -- jitterShift grows with ping variance (>40ms range triggers), capped at 25ms shift / +50ms window.
+    local jitterShift = 0
+    if pingJitter > 40 then
+        jitterShift = math.min(0.025, (pingJitter - 40) / 4000)
+    end
+    local adjustedReactionTime = (optimalReactionTime * HeightMultiplier)
+        + (CFG.ParryOffset or 0)
+        + cachedMovementBias       -- velocity-driven early-fire while moving
+        - jitterShift              -- pull leading edge earlier under ping instability
+    local window = (tonumber(CFG.ParryWindow) or 0.20) + jitterShift * 2
     local ClockStart = StartTime + adjustedReactionTime
     local ClockEnd = StartTime + adjustedReactionTime + window
     return ClockStart, ClockEnd
@@ -1074,10 +1423,7 @@ local function ExecuteParry(regData, attackConfig)
     if LocalStunned then return end
     if not CFG.Enabled then return end
 
-    local isHeavy = attackConfig.Heavy
-        or attackConfig.DisplayName == "M2"
-        or attackConfig.DisplayName == "Heavy"
-        or (tostring(attackConfig.DisplayName or ""):find("M2") ~= nil)
+    local isHeavy = IsHeavy(attackConfig)
 
     -- ForceParry counters: always F
     if attackConfig.ForceParry then
@@ -1096,15 +1442,41 @@ local function ExecuteParry(regData, attackConfig)
         return
     end
 
-    if isHeavy and CFG.AutoDodge then
-        Dodge()
-        parryCount = parryCount + 1
-        return
+    if isHeavy then
+        -- v9.4.5 Crit Defense: 50/50 F/Q on heavies, overrides AutoDodge when active
+        if CFG.CritDefense then
+            if math.random(1, 2) == 1 then
+                -- Parry branch
+                if LastPendingRegData ~= regData then
+                    LastPendingRegData = regData
+                    AntiFeintTarget = regData
+                    AntiFeintFireTime = now
+                    BlockStart(regData.BlockStart, CFG.ParryHold)
+                    parryCount = parryCount + 1
+                end
+            else
+                Dodge(true)  -- force dodge regardless of AutoDodge
+                parryCount = parryCount + 1
+            end
+            if CFG.Debug then
+                print(string.format("[Olympus CritDefense] %s | %s",
+                    tostring(attackConfig.Style), tostring(attackConfig.DisplayName)))
+            end
+            return
+        end
+        if CFG.AutoDodge then
+            Dodge()
+            parryCount = parryCount + 1
+            return
+        end
     end
 
     -- Identical to source gate
     if LastPendingRegData ~= regData then
         LastPendingRegData = regData
+        -- v9.4.5 Anti Feint: remember what we fired on so cleanup pass can detect early cancel
+        AntiFeintTarget = regData
+        AntiFeintFireTime = now
         BlockStart(regData.BlockStart, CFG.ParryHold)
         parryCount = parryCount + 1
         if CFG.SoundOnParry then
@@ -1124,6 +1496,8 @@ local function ExecuteParry(regData, attackConfig)
     elseif LastPendingRegData == regData then
         if regData.DidALoop then
             regData.DidALoop = false
+            AntiFeintTarget = regData
+            AntiFeintFireTime = now
             BlockStart(regData.BlockStart, CFG.ParryHold)
             parryCount = parryCount + 1
         end
@@ -1166,13 +1540,23 @@ end
 
 local _animScratch = {}
 local function getAnims(character)
-    if not character or not AnimTrackerInst then return _animScratch end
     for i = #_animScratch, 1, -1 do _animScratch[i] = nil end
-    local ok, tracks = pcall(AnimTrackerInst.Update, AnimTrackerInst, character)
-    if not ok or not tracks then return _animScratch end
-    for _, t in ipairs(tracks) do
+    if not character or not AnimTrackerInst then return _animScratch end
+    -- Guard: Matcha tracker can throw "attempt to index nil with 'X'" on invalid/despawned chars
+    if character.Parent == nil then return _animScratch end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return _animScratch end
+    local ok, tracks = pcall(function()
+        return AnimTrackerInst:Update(character)
+    end)
+    if not ok or type(tracks) ~= "table" then return _animScratch end
+    for i = 1, #tracks do
+        local t = tracks[i]
         if t and t.AnimationId then
-            _animScratch[#_animScratch+1] = {id=tostring(t.AnimationId), pos=t.TimePosition or 0}
+            _animScratch[#_animScratch + 1] = {
+                id = tostring(t.AnimationId),
+                pos = tonumber(t.TimePosition) or 0,
+            }
         end
     end
     return _animScratch
@@ -1202,7 +1586,7 @@ local function rhythmKeyByte(key)
     return string.byte(key:sub(1, 1):upper())
 end
 
-function RhythmAutoHitTick()
+local function RhythmAutoHitTick()
     local gui = LocalPlayer:FindFirstChild("PlayerGui")
     if not gui then return end
     local RhythmServiceUI = gui:FindFirstChild("RhythmServiceUI")
@@ -1220,9 +1604,14 @@ function RhythmAutoHitTick()
         for name, key in pairs(Receptors) do
             local rec = ReceptorLookup:FindFirstChild(name)
             if rec then
-                count = count + 1
-                local rx = math.floor(rec.AbsolutePosition.X + rec.AbsoluteSize.X / 2)
-                ReceptorXMap[rx] = { ReceptorName = name, Key = key, Receptor = rec }
+                local rx
+                pcall(function()
+                    rx = math.floor(rec.AbsolutePosition.X + rec.AbsoluteSize.X / 2)
+                end)
+                if rx then
+                    count = count + 1
+                    ReceptorXMap[rx] = { ReceptorName = name, Key = key, KeyByte = rhythmKeyByte(key), Receptor = rec }
+                end
             end
         end
         if count == 2 then
@@ -1239,17 +1628,26 @@ function RhythmAutoHitTick()
         for name, key in pairs(Receptors) do
             local rec = ReceptorLookup:FindFirstChild(name)
             if rec then
-                local rx = math.floor(rec.AbsolutePosition.X + rec.AbsoluteSize.X / 2)
-                ReceptorXMap[rx] = { ReceptorName = name, Key = key, Receptor = rec }
+                local rx
+                pcall(function()
+                    rx = math.floor(rec.AbsolutePosition.X + rec.AbsoluteSize.X / 2)
+                end)
+                if rx then
+                    ReceptorXMap[rx] = { ReceptorName = name, Key = key, KeyByte = rhythmKeyByte(key), Receptor = rec }
+                end
             end
         end
         LastRhythmCache = now
     end
 
-    for _, note in pairs(Lanes:GetChildren()) do
+    for _, note in ipairs(Lanes:GetChildren()) do
         if note.Name ~= "NoteTemplate" then continue end
-        local notePos = note.AbsolutePosition
-        local noteSize = note.AbsoluteSize
+        local notePos, noteSize
+        pcall(function()
+            notePos = note.AbsolutePosition
+            noteSize = note.AbsoluteSize
+        end)
+        if not notePos or not noteSize then continue end
         local noteX = math.floor(notePos.X + noteSize.X / 2)
 
         local match
@@ -1259,28 +1657,39 @@ function RhythmAutoHitTick()
                 break
             end
         end
-        if not match then continue end
+        if not match or not match.Receptor then continue end
 
         local receptor = match.Receptor
-        local receptorPos = receptor.AbsolutePosition
-        local key = match.Key
+        local receptorPos
+        pcall(function() receptorPos = receptor.AbsolutePosition end)
+        if not receptorPos then continue end
         local rName = match.ReceptorName
-        local b = rhythmKeyByte(key)
+        local b = match.KeyByte
         if not b then continue end
 
         local tail = note:FindFirstChild("Tail")
-        local hasTail = tail and tail.AbsoluteSize and tail.AbsoluteSize.Y > 0
+        local hasTail = false
+        pcall(function()
+            hasTail = tail and tail.AbsoluteSize and tail.AbsoluteSize.Y > 0
+        end)
 
         if hasTail then
-            local whenHold = (tail.AbsolutePosition.Y + tail.AbsoluteSize.Y) - receptorPos.Y
-            if whenHold + 15 > Threshold then
+            local whenHold
+            pcall(function()
+                whenHold = (tail.AbsolutePosition.Y + tail.AbsoluteSize.Y) - receptorPos.Y
+            end)
+            if whenHold and whenHold + 15 > Threshold then
                 if not HeldKeys[rName] then
                     HeldKeys[rName] = true
                     pcall(function() keypress(b) end)
                 end
             end
             if HeldKeys[rName] then
-                if (tail.AbsolutePosition.Y - receptorPos.Y) > 0 then
+                local release = false
+                pcall(function()
+                    release = (tail.AbsolutePosition.Y - receptorPos.Y) > 0
+                end)
+                if release then
                     HeldKeys[rName] = nil
                     pcall(function() keyrelease(b) end)
                 end
@@ -1315,49 +1724,53 @@ local debugLastPrint = 0
 local selectedConfig = "Default"
 local TargetLabel = nil
 
+-- Hoisted scratch buffers for cycleTargets (runs 2Hz on Heartbeat)
+local _candidates, _valid, _finals = {}, {}, {}
+local function _validSortAsc(a, b) return a.d < b.d end
+
 local function cycleTargets()
     local lc = LocalPlayer.Character
     local lr = lc and lc:FindFirstChild("HumanoidRootPart")
     if not lr then updateTargets({}) return end
-    local candidates = {}
+    table.clear(_candidates)
     pcall(function()
         for _, p in pairs(PlayersSvc:GetPlayers()) do
             if p ~= LocalPlayer and p.Character then
-                candidates[#candidates+1] = p.Character
+                _candidates[#_candidates+1] = p.Character
             end
         end
     end)
-    local valid = {}
-    for _, c in ipairs(candidates) do
+    table.clear(_valid)
+    for _, c in ipairs(_candidates) do
         local tr = c:FindFirstChild("HumanoidRootPart")
         local h  = c:FindFirstChildWhichIsA("Humanoid")
         if tr and h and h.Health > 0 then
             local d = (lr.Position-tr.Position).Magnitude
-            if d <= CFG.CycleRange then table.insert(valid,{c=c,d=d}) end
+            if d <= CFG.CycleRange then table.insert(_valid,{c=c,d=d}) end
         end
     end
-    table.sort(valid, function(a,b) return a.d < b.d end)
-    local finals = {}
+    table.sort(_valid, _validSortAsc)
+    table.clear(_finals)
     if CFG.MultiTarget then
-        for i=1,math.min(3,#valid) do table.insert(finals,valid[i].c) end
-    elseif CFG.AutoTargetNearest and #valid > 0 then
-        table.insert(finals, valid[1].c)  -- nearest only
-    elseif #valid > 0 then
+        for i=1,math.min(3,#_valid) do table.insert(_finals,_valid[i].c) end
+    elseif CFG.AutoTargetNearest and #_valid > 0 then
+        table.insert(_finals, _valid[1].c)  -- nearest only
+    elseif #_valid > 0 then
         -- keep previous lock if still valid, else nearest
         local prev = TargetCharacters[1]
         local keep = false
         if prev then
-            for _, v in ipairs(valid) do
+            for _, v in ipairs(_valid) do
                 if v.c == prev then keep = true break end
             end
         end
         if keep then
-            table.insert(finals, prev)
+            table.insert(_finals, prev)
         else
-            table.insert(finals, valid[1].c)
+            table.insert(_finals, _valid[1].c)
         end
     end
-    updateTargets(finals)
+    updateTargets(_finals)
 end
 
 local UnknownLog = {} local UnknownOrder = {}
@@ -1399,9 +1812,8 @@ pcall(function()
     end)
 end)
 
--- ── MAIN LOOP — exact same as source ──
--- Source: RunService.RenderStepped:Connect(MainLoop)
---         → EvaluateParryTriggers() + ParryTask() every frame, no rate limit
+-- ── MAIN LOOP — same AP path as source (RenderStepped, no rate limit) ──
+-- Non-AP utilities moved to a light Heartbeat so RS stays lean.
 OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
     local now = os.clock()
 
@@ -1410,137 +1822,93 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
         BlockEnd()
     end
 
-    -- Local stun / parry state from anim lists
-    do
-        LocalStunned = false
-        LocalParrying = false
-        local char = LocalPlayer.Character
-        if char then
-            local anims = getAnims(char)
-            for _, a in ipairs(anims) do
-                if a and a.id then
-                    if animSetHas(StunnedAnimation, a.id) then
-                        LocalStunned = true
-                    end
-                    if animSetHas(ParryingAnimation, a.id) then
-                        LocalParrying = true
-                        if CurrentParryState == ParryState.INPUT_PENDING then
-                            TransitionToState(ParryState.PARRYING)
-                            ParryRegisteredTime = now
-                        end
-                    end
-                    if animSetHas(ParriedAnimation, a.id) or animSetHas(ParryFailedAnimation, a.id) then
-                        if CurrentParryState ~= ParryState.IDLE then
-                            TransitionToState(ParryState.IDLE)
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- Rhythm Auto-Hit
+    -- Rhythm stays on RS for note accuracy (only when enabled)
     if CFG.RhythmAutoHit then
         pcall(RhythmAutoHitTick)
     end
 
-    -- Auto-respawn
-    local respawnDelay = tonumber(CFG.RespawnDelay) or 1.5
-    if pendingRespawn and CFG.AutoRespawn and (now - pendingRespawn) >= respawnDelay then
-        pendingRespawn = nil
-        pcall(function() LocalPlayer:LoadCharacter() end)
-    end
-
-    -- Anti-AFK
-    local afkInterval = tonumber(CFG.AFKInterval) or 240
-    if CFG.AntiAFK and (now - lastAFKPing) >= afkInterval then
-        lastAFKPing = now
-        pcall(function()
-            keypress(32)
-            keyrelease(32)
-        end)
-    end
-
-    -- Target cycle + registry cleanup of dead keys
-    if (now - lastCycle) >= 0.5 then
-        lastCycle = now
-        pcall(cycleTargets)
-        if TargetLabel then
-            pcall(function()
-                local names = {}
-                for _, ch in ipairs(TargetCharacters) do
-                    names[#names + 1] = ch.Name
-                end
-                local pool = #names > 0 and table.concat(names, ", ") or "(none)"
-                TargetLabel:SetText("Locked: " .. pool)
-            end)
-        end
-    end
-
+    -- ── AP eval (unchanged logic) ──
     if not CFG.Enabled then return end
     if not AnimTrackerInst then return end
+    -- v9.4.3: early-exit when stunned — can't parry anyway, skip the whole target+anim scan
+    if LocalStunned then return end
     local lc = LocalPlayer.Character
     local lr = lc and lc:FindFirstChild("HumanoidRootPart")
     if not lr then return end
 
+    local apRange = CFG.APRange
+    local doDebug = CFG.Debug
     local currentActiveIds = {}
+    local targets = TargetCharacters
+    local nTargets = #targets
 
-    for _, c in pairs(TargetCharacters) do
+    for ti = 1, nTargets do
+        local c = targets[ti]
         local tr = c:FindFirstChild("HumanoidRootPart")
         if not tr then continue end
         local dist = (lr.Position - tr.Position).Magnitude
-        if dist > CFG.APRange then continue end
+        if dist > apRange then continue end
 
+        local charKey = tostring(c)  -- Instance tostring is stable for its lifetime
         local anims = getAnims(c)
-        if CFG.Debug and (now - debugLastPrint) > 2 then
+        if doDebug and (now - debugLastPrint) > 2 then
             debugLastPrint = now
-            print("[Olympus DEBUG] targets=" .. #TargetCharacters ..
+            print("[Olympus DEBUG] targets=" .. nTargets ..
                 " anims=" .. #anims .. " dist=" .. math.floor(dist))
-            for _, a in pairs(anims) do
+            for ai = 1, #anims do
+                local a = anims[ai]
                 print("  " .. a.id .. " inDB=" .. tostring(GameConfig[a.id] ~= nil) .. " pos=" .. a.pos)
             end
         end
 
-        for _, anim in pairs(anims) do
-            local config = GameConfig[anim.id]
+        for ai = 1, #anims do
+            local anim = anims[ai]
+            local animId = anim.id
+            local config = GameConfig[animId]
             if not config then
-                if CFG.Debug and not UnknownLog[anim.id] then
-                    UnknownLog[anim.id] = true
-                    local num = anim.id:match("%d+$") or anim.id:match("%d+")
+                if doDebug and not UnknownLog[animId] and #UnknownOrder < 500 then
+                    UnknownLog[animId] = true
+                    local num = animId:match("%d+$") or animId:match("%d+")
                     if num then
-                        table.insert(UnknownOrder, num)
-                        print("[Olympus UNKNOWN]", anim.id)
+                        UnknownOrder[#UnknownOrder + 1] = num
+                        print("[Olympus UNKNOWN]", animId)
                     end
                 end
                 continue
             end
 
             -- Source uses anim.Address; we use character|id
-            local animKey = tostring(c) .. "|" .. tostring(anim.id)
+            local animKey = charKey .. "|" .. animId
             currentActiveIds[animKey] = true
 
-            local regData = UpdateAnimationRegistry(animKey, anim.id, now, anim.pos or 0, config, c)
+            local regData = UpdateAnimationRegistry(animKey, animId, now, anim.pos or 0, config, c)
             if regData.Processed then continue end
 
+            -- v9.4.5 WC Fake Wiff: intercept WingChun M2 counter before ForceParry fires
+            if CFG.WCFakeWiff and config.ForceParry and config.Style == "WingChunAnims" then
+                if not regData.FakeWiffDone then
+                    regData.FakeWiffDone = true
+                    regData.Processed = true
+                    doWCFakeWiff(c)
+                    if CFG.Debug then print("[Olympus] WC Fake Wiff triggered on", c.Name) end
+                end
+                continue
+            end
+
             -- ParryFunction first (source order)
-            if TryParryFunction(regData, config, c, anim.id) then
+            if TryParryFunction(regData, config, c, animId) then
                 continue
             end
 
             -- Direction checks — source skips heavies; uses 0.1 when toggles on
-            -- (FacingThreshold slider still applied if user raised it)
             do
-                local isHeavy = config.Heavy
-                    or config.DisplayName == "M2"
-                    or config.DisplayName == "Heavy"
-                    or (tostring(config.DisplayName or ""):find("M2") ~= nil)
+                local isHeavy = IsHeavy(config)
                 if not isHeavy and (CFG.TargetFacingYou or CFG.YouFacingTarget) then
                     local passed = true
-                    pcall(function()
-                        local threshold = tonumber(CFG.FacingThreshold) or 0.1
-                        local direction = (tr.Position - lr.Position)
-                        local mag = direction.Magnitude
-                        if mag < 0.001 then return end
+                    local threshold = tonumber(CFG.FacingThreshold) or 0.1
+                    local direction = tr.Position - lr.Position
+                    local mag = direction.Magnitude
+                    if mag >= 0.001 then
                         direction = direction / mag
                         if CFG.TargetFacingYou then
                             if tr.CFrame.LookVector:Dot(-direction) < threshold then
@@ -1552,7 +1920,7 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
                                 passed = false
                             end
                         end
-                    end)
+                    end
                     if not passed then continue end
                 end
             end
@@ -1564,7 +1932,18 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
                 continue
             end
 
-            -- Continuous window — identical to source
+            -- v9.4.3 live recompute, v9.4.4 throttled to every 3rd RS frame.
+            -- At 240Hz: ~12ms refresh — well inside ParryWindow (default 200ms) and jitter headroom.
+            -- Initial values from UpdateAnimationRegistry are already fresh, so skipping frames 1-2 is safe.
+            -- LastPendingRegData gate catches post-fire shifts — recompute cannot double-fire.
+            regData._recomputeFrame = (regData._recomputeFrame or 0) + 1
+            if regData._recomputeFrame >= 3 then
+                regData._recomputeFrame = 0
+                local liveBlockStart, liveBlockExpire = CalculateParryTiming(config, regData.StartTime, c)
+                regData.BlockStart = liveBlockStart
+                regData.BlockExpire = liveBlockExpire
+            end
+
             local BlockExpireTimer = regData.BlockExpire - now
             if now >= regData.BlockStart and BlockExpireTimer >= 0 then
                 ExecuteParry(regData, config)
@@ -1575,10 +1954,147 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
     -- Cleanup registry entries whose animations stopped
     for key, val in pairs(AnimationRegistry) do
         if not currentActiveIds[key] then
+            -- v9.4.5 Anti Feint: fired-upon attack vanished before parry registered → it was a feint
+            if CFG.AntiFeint and KeyHeld and val == AntiFeintTarget and not LocalParrying then
+                local sinceFire = now - AntiFeintFireTime
+                if sinceFire < 0.4 then
+                    BlockEnd()
+                    AntiFeintTarget = nil
+                    if CFG.Debug then
+                        print("[Olympus AntiFeint] released F — attack cancelled at " ..
+                            string.format("%.3fs", sinceFire))
+                    end
+                end
+            end
             if LastPendingRegData == val then
                 LastPendingRegData = nil
             end
+            if AntiFeintTarget == val then
+                AntiFeintTarget = nil
+            end
             AnimationRegistry[key] = nil
+        end
+    end
+
+    -- Clear Anti Feint target if we successfully entered PARRYING state
+    if LocalParrying and AntiFeintTarget then
+        AntiFeintTarget = nil
+    end
+end))
+
+-- Light utility tick (not on RenderStepped — keeps AP frame clean)
+OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
+    if not OlympusState.Alive then return end
+    local now = os.clock()
+
+    -- Ping cache refresh (10Hz) + jitter ring buffer update
+    if (now - lastPingUpdate) >= 0.1 then
+        lastPingUpdate = now
+        CachedPing = GetPingValue()
+        pingSamples[pingSampleIdx] = CachedPing
+        pingSampleIdx = pingSampleIdx % PING_SAMPLE_COUNT + 1
+        local lo, hi = math.huge, -math.huge
+        for i = 1, PING_SAMPLE_COUNT do
+            local v = pingSamples[i]
+            if v < lo then lo = v end
+            if v > hi then hi = v end
+        end
+        pingJitter = hi - lo
+    end
+
+    -- Movement-bias cache (velocity-driven early-fire)
+    do
+        local char = LocalPlayer.Character
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local v = hrp.AssemblyLinearVelocity
+                local horizSpeed = math.sqrt(v.X * v.X + v.Z * v.Z)
+                if horizSpeed > 20 then
+                    cachedMovementBias = -0.015
+                elseif horizSpeed > 8 then
+                    cachedMovementBias = -0.008
+                else
+                    cachedMovementBias = 0
+                end
+            else
+                cachedMovementBias = 0
+            end
+        else
+            cachedMovementBias = 0
+        end
+    end
+
+    -- Local stun / parry state from own-character anim list (moved from RS for consistency under movement).
+    -- v9.4.4: skip entirely when AP is disabled — matcha Update is the single biggest HB cost.
+    if CFG.Enabled then
+        LocalStunned = false
+        LocalParrying = false
+        local char = LocalPlayer.Character
+        if char then
+            local anims = getAnims(char)
+            for i = 1, #anims do
+                local a = anims[i]
+                local id = a and a.id
+                if id then
+                    if animSetHas(StunnedAnimation, id) then
+                        LocalStunned = true
+                    end
+                    if animSetHas(ParryingAnimation, id) then
+                        LocalParrying = true
+                        if CurrentParryState == ParryState.INPUT_PENDING then
+                            TransitionToState(ParryState.PARRYING)
+                            ParryRegisteredTime = now
+                        end
+                    end
+                    if animSetHas(ParriedAnimation, id) or animSetHas(ParryFailedAnimation, id) then
+                        if CurrentParryState ~= ParryState.IDLE then
+                            TransitionToState(ParryState.IDLE)
+                        end
+                    end
+                end
+            end
+        end
+    else
+        LocalStunned = false
+        LocalParrying = false
+    end
+
+    -- Auto-respawn
+    if pendingRespawn and CFG.AutoRespawn then
+        local respawnDelay = tonumber(CFG.RespawnDelay) or 1.5
+        if (now - pendingRespawn) >= respawnDelay then
+            pendingRespawn = nil
+            pcall(function() LocalPlayer:LoadCharacter() end)
+        end
+    end
+
+    -- Anti-AFK
+    if CFG.AntiAFK then
+        local afkInterval = tonumber(CFG.AFKInterval) or 240
+        if (now - lastAFKPing) >= afkInterval then
+            lastAFKPing = now
+            pcall(function()
+                keypress(32)
+                keyrelease(32)
+            end)
+        end
+    end
+
+    -- Target cycle + label (0.5s like source utility tick)
+    if (now - lastCycle) >= 0.5 then
+        lastCycle = now
+        pcall(cycleTargets)
+        pcall(updateOpponentHPBars)  -- v9.4.5 — same cadence as target cycle
+        if TargetLabel then
+            pcall(function()
+                local names = {}
+                for i = 1, #TargetCharacters do
+                    names[#names + 1] = TargetCharacters[i].Name
+                end
+                local pool = #names > 0 and table.concat(names, ", ") or "(none)"
+                TargetLabel:SetText("Locked: " .. pool)
+            end)
         end
     end
 end))
@@ -1604,10 +2120,50 @@ end
 
 local UI_Window = UI_Library:CreateWindow({
     title="Olympus",size=Vector2.new(740,580),configFolder="olympus_base",
+    opacity = 1,
 })
+
+-- Pure black section/panel fill (kills grey wash)
+-- SetPerformance here is driven by menu visibility (see syncMenuPerformance below).
+local function applyDarkTheme()
+    pcall(function()
+        if UI_Library.SetOpacity then UI_Library:SetOpacity(1) end
+        if UI_Library.SetTheme then
+            UI_Library:SetTheme({
+                Background = Color3.fromRGB(0, 0, 0),
+            })
+        end
+    end)
+end
+
+-- v9.4.4 menu auto-perf: INS tweens have real GPU cost when menu is open.
+-- SetPerformance(true) = tweens disabled = faster. We want that when menu is hidden
+-- (fighting), and tweens enabled when menu is visible (user is interacting).
+local menuVisible = true  -- INS creates the window visible on inject
+local function syncMenuPerformance()
+    pcall(function()
+        if UI_Library and UI_Library.SetPerformance then
+            UI_Library:SetPerformance(not menuVisible)
+        end
+    end)
+end
+applyDarkTheme()
+
+-- Menu background — INS draws this ABOVE section cards (z ~119999).
+-- High alpha = grey wash over everything. Keep low so black panels read solid.
+local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/olympus-ppAP/main/content.png"
+local function applyMenuBackground()
+    pcall(function()
+        if UI_Library and UI_Library.SetBackgroundImage then
+            UI_Library:SetBackgroundImage(BG_IMAGE_URL, 0.10, 1, 1)
+        end
+    end)
+end
+applyMenuBackground()
 
 local CombatTab   = UI_Window:Tab("Combat","sword")
 local TimingsTab  = UI_Window:Tab("Timings","clock")
+local TechsTab    = UI_Window:Tab("Techs","zap")
 local SettingsTab = UI_Window:Tab("Settings","gear")
 local UpdatesTab  = UI_Window:Tab("Updates","book-closed")
 
@@ -1737,7 +2293,32 @@ local function applySettings(s)
         -- facing conditions
     if s.TargetFacingYou ~=nil then CFG.TargetFacingYou=s.TargetFacingYou setToggle(UIRefs.TargetFacingYou,s.TargetFacingYou) end
     if s.YouFacingTarget ~=nil then CFG.YouFacingTarget=s.YouFacingTarget  setToggle(UIRefs.YouFacingTarget,s.YouFacingTarget) end
-    if s.FacingThreshold       then CFG.FacingThreshold=s.FacingThreshold  setSlider(UIRefs.FacingThreshold,s.FacingThreshold) end
+    if s.FacingThreshold ~=nil then CFG.FacingThreshold=s.FacingThreshold  setSlider(UIRefs.FacingThreshold,s.FacingThreshold) end
+    if s.AutoHeight      ~=nil then CFG.AutoHeight=s.AutoHeight            setToggle(UIRefs.AutoHeight,s.AutoHeight) end
+    if s.HeightInfluence ~=nil then CFG.HeightInfluence=s.HeightInfluence  setSlider(UIRefs.HeightInfluence,s.HeightInfluence) end
+    -- v9.4.5 feature pack
+    if s.AntiFeint     ~=nil then CFG.AntiFeint=s.AntiFeint             setToggle(UIRefs.AntiFeint,s.AntiFeint) end
+    if s.CritDefense   ~=nil then CFG.CritDefense=s.CritDefense         setToggle(UIRefs.CritDefense,s.CritDefense) end
+    if s.WCFakeWiff    ~=nil then CFG.WCFakeWiff=s.WCFakeWiff           setToggle(UIRefs.WCFakeWiff,s.WCFakeWiff) end
+    if s.WCFakeWiffTime      then CFG.WCFakeWiffTime=s.WCFakeWiffTime   setSlider(UIRefs.WCFakeWiffTime,s.WCFakeWiffTime) end
+    if s.ShadowStep    ~=nil then CFG.ShadowStep=s.ShadowStep           setToggle(UIRefs.ShadowStep,s.ShadowStep) end
+    if s.ShadowCrit    ~=nil then CFG.ShadowCrit=s.ShadowCrit           setToggle(UIRefs.ShadowCrit,s.ShadowCrit) end
+    if s.PersonalHP    ~=nil then
+        CFG.PersonalHP=s.PersonalHP
+        setToggle(UIRefs.PersonalHP,s.PersonalHP)
+        if s.PersonalHP then buildPersonalHP() else cleanupPersonalHP() end
+    end
+    if s.OpponentHP    ~=nil then
+        CFG.OpponentHP=s.OpponentHP
+        setToggle(UIRefs.OpponentHP,s.OpponentHP)
+        if not s.OpponentHP then clearAllOpponentHPBars() end
+    end
+    if s.HPViewRange         then CFG.HPViewRange=s.HPViewRange         setSlider(UIRefs.HPViewRange,s.HPViewRange) end
+    if s.LowLagMode    ~=nil then
+        CFG.LowLagMode=s.LowLagMode
+        setToggle(UIRefs.LowLagMode,s.LowLagMode)
+        if s.LowLagMode then clearAllOpponentHPBars() end
+    end
     -- misc
     if s.SoundOnParry    ~=nil then CFG.SoundOnParry=s.SoundOnParry end
     if s.AntiAFK         ~=nil then CFG.AntiAFK=s.AntiAFK                 setToggle(UIRefs.AntiAFK,s.AntiAFK) end
@@ -1797,6 +2378,14 @@ ProfilesSec:Button("Save Current",function()
             -- facing conditions
             TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
             FacingThreshold=CFG.FacingThreshold,
+            -- height
+            AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
+            -- v9.4.5 feature pack
+            AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
+            WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
+            ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
+            PersonalHP=CFG.PersonalHP, OpponentHP=CFG.OpponentHP, HPViewRange=CFG.HPViewRange,
+            LowLagMode=CFG.LowLagMode,
             -- ranges + timing
             CycleRange=CFG.CycleRange, APRange=CFG.APRange,
             ParryOffset=CFG.ParryOffset, ParryHold=CFG.ParryHold, ParryWindow=CFG.ParryWindow,
@@ -1878,6 +2467,141 @@ ProfilesSec:Button("Reset Timings (built-in)",function()
     end
     if bindStyle then pcall(bindStyle,currentStyleEdit) end
     UI_Library:Notify("Profiles","Timings reset")
+end)
+
+-- ── v9.4.3 config sharing ──
+ProfilesSec:Divider("Share")
+ProfilesSec:Info("Export your timings+settings to clipboard, or import someone else's")
+
+local function buildSharePayload()
+    -- Pull live keybind from pill
+    local kb = "g"
+    pcall(function()
+        if APToggleElement and APToggleElement.Bind and type(APToggleElement.Bind.Value) == "string"
+            and #APToggleElement.Bind.Value > 0 and APToggleElement.Bind.Value ~= "none" then
+            kb = APToggleElement.Bind.Value
+        elseif readAPKeybind then
+            kb = readAPKeybind() or kb
+        end
+    end)
+    CFG.APKeybind = tostring(kb):lower()
+    local t = {}
+    for id, info in pairs(GameConfig) do t[id] = info.ReactionTime or DefaultRT end
+    return {
+        _format = "olympus-share-v1",
+        Timings = t,
+        Settings = {
+            Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
+            MultiTarget=CFG.MultiTarget, Debug=CFG.Debug,
+            TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
+            FacingThreshold=CFG.FacingThreshold,
+            AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
+            -- v9.4.5 feature pack
+            AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
+            WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
+            ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
+            PersonalHP=CFG.PersonalHP, OpponentHP=CFG.OpponentHP, HPViewRange=CFG.HPViewRange,
+            LowLagMode=CFG.LowLagMode,
+            CycleRange=CFG.CycleRange, APRange=CFG.APRange,
+            ParryOffset=CFG.ParryOffset, ParryHold=CFG.ParryHold, ParryWindow=CFG.ParryWindow,
+            ProbabilityToParry=CFG.ProbabilityToParry,
+            PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
+            RhythmAutoHit=CFG.RhythmAutoHit,
+            DefaultRT=DefaultRT, APKeybind=CFG.APKeybind,
+            SoundOnParry=CFG.SoundOnParry,
+            AntiAFK=CFG.AntiAFK, AFKInterval=CFG.AFKInterval,
+            AutoRespawn=CFG.AutoRespawn, RespawnDelay=CFG.RespawnDelay,
+            AutoParryRange=CFG.APRange,
+        },
+    }
+end
+
+local function applyShared(data)
+    local tApplied, tMissing = 0, 0
+    if type(data.Timings) == "table" then
+        for id, rt in pairs(data.Timings) do
+            local key = tostring(id)
+            if not key:find("rbxassetid://", 1, true) then key = "rbxassetid://" .. key end
+            if GameConfig[key] then
+                GameConfig[key].ReactionTime = tonumber(rt) or 0.1
+                tApplied = tApplied + 1
+            else
+                tMissing = tMissing + 1
+            end
+        end
+    end
+    local sApplied = 0
+    if type(data.Settings) == "table" then
+        applySettings(data.Settings)
+        for _ in pairs(data.Settings) do sApplied = sApplied + 1 end
+    end
+    if bindStyle then pcall(bindStyle, currentStyleEdit) end
+    return tApplied, tMissing, sApplied
+end
+
+ProfilesSec:Button("Export to Clipboard", function()
+    local ok, err = pcall(function()
+        local payload = buildSharePayload()
+        local json = HttpService:JSONEncode(payload)
+        setclipboard(json)
+    end)
+    if ok then
+        UI_Library:Notify("Share", "Copied — paste to send")
+    else
+        UI_Library:Notify("Share", "Export failed: " .. tostring(err))
+    end
+end)
+
+ProfilesSec:Button("Import from Clipboard", function()
+    local ok, text = pcall(getclipboard)
+    if not ok or type(text) ~= "string" or text == "" then
+        UI_Library:Notify("Share", "Clipboard empty or unreadable")
+        return
+    end
+    local okJ, data = pcall(function() return HttpService:JSONDecode(text) end)
+    if not okJ or type(data) ~= "table" then
+        UI_Library:Notify("Share", "Clipboard isn't valid Olympus JSON")
+        return
+    end
+    local tApplied, tMissing, sApplied = applyShared(data)
+    UI_Library:Notify("Share", string.format(
+        "Imported %d timings (%d skipped), %d settings", tApplied, tMissing, sApplied))
+end)
+
+-- URL fetch (raw GitHub gist, pastebin raw, etc.)
+local pendingUrl = ""
+do
+    local made = false
+    for _, method in pairs({"Textbox","Input","TextInput","TextBox"}) do
+        local ok = pcall(function()
+            ProfilesSec[method](ProfilesSec,"Import URL","raw gist/pastebin URL + Enter",
+                function(t) pendingUrl = tostring(t or "") end)
+        end)
+        if ok then made = true break end
+    end
+    if not made then
+        ProfilesSec:Info("Textbox unavailable — use clipboard import instead")
+    end
+end
+ProfilesSec:Button("Fetch & Load URL", function()
+    local url = pendingUrl
+    if not url or url == "" then
+        UI_Library:Notify("Share", "Type a URL in the Import URL field first")
+        return
+    end
+    local okFetch, body = pcall(function() return game:HttpGet(url) end)
+    if not okFetch or type(body) ~= "string" or body == "" then
+        UI_Library:Notify("Share", "Fetch failed — check URL + executor HttpGet permission")
+        return
+    end
+    local okJ, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not okJ or type(data) ~= "table" then
+        UI_Library:Notify("Share", "URL did not return valid Olympus JSON")
+        return
+    end
+    local tApplied, tMissing, sApplied = applyShared(data)
+    UI_Library:Notify("Share", string.format(
+        "Loaded from URL: %d timings (%d skipped), %d settings", tApplied, tMissing, sApplied))
 end)
 
 -- Armed
@@ -2122,11 +2846,41 @@ do
 end
 bindStyle(currentStyleEdit)
 
+-- ── Techs Tab (v9.4.5) ────────────────────────
+local AntiFeintSec   = TechsTab:Section("Anti Feint","Left")
+local CritDefSec     = TechsTab:Section("Crit Defense","Left")
+local WCFakeSec      = TechsTab:Section("Wing Chun Fake Wiff","Right")
+local ShadowSec      = TechsTab:Section("Shadow Techs","Right")
+
+AntiFeintSec:Info("Releases F if the fired-upon attack cancels before parry registers")
+UIRefs.AntiFeint = AntiFeintSec:Toggle("Anti Feint", false, function(v) CFG.AntiFeint = v end)
+AntiFeintSec:Info("Protects against feint bait — detection window is 400ms post-fire")
+
+CritDefSec:Info("Randomizes F / Q (50/50) on Heavy / M2 attacks. Overrides Auto Dodge when on.")
+UIRefs.CritDefense = CritDefSec:Toggle("Crit Defense", false, function(v) CFG.CritDefense = v end)
+CritDefSec:Info("Breaks pattern reads where opponent expects pure dodge on crits")
+
+WCFakeSec:Info("On WingChun M2 (counter), rotates away + fires M1 so your M1 whiffs,")
+WCFakeSec:Info("baiting their counter to activate on empty air")
+UIRefs.WCFakeWiff = WCFakeSec:Toggle("WC Counter Fake Wiff", false, function(v) CFG.WCFakeWiff = v end)
+UIRefs.WCFakeWiffTime = WCFakeSec:Slider("Fake Wiff Time",0.18,0.01,0.05,0.4,"s",function(v)
+    CFG.WCFakeWiffTime = tonumber(v) or 0.18
+end)
+UIRefs.WCFakeWiffTime:Set(0.18)
+WCFakeSec:Info("Duration of the rotation before snapping back")
+
+ShadowSec:Info("Z = Shadow Step | B = Shadow Crit")
+ShadowSec:Info("Both press F+Q rapidly (3 taps, ~40ms each)")
+UIRefs.ShadowStep = ShadowSec:Toggle("Shadow Step (Z)", false, function(v) CFG.ShadowStep = v end)
+UIRefs.ShadowCrit = ShadowSec:Toggle("Shadow Crit (B)", false, function(v) CFG.ShadowCrit = v end)
+
 -- ── Settings Tab ────────────────────────────
 local MiscSec     = SettingsTab:Section("Misc","Left")
 local AntiAFKSec  = SettingsTab:Section("Anti-AFK","Left")
 local RespawnSec  = SettingsTab:Section("Auto Respawn","Right")
 local SessionSec  = SettingsTab:Section("Session","Right")
+local VisualsSec  = SettingsTab:Section("Visuals","Left")
+local PerfSec     = SettingsTab:Section("Performance","Right")
 
 
 -- Misc
@@ -2188,8 +2942,32 @@ SessionSec:Button("Reset Counter",function()
     pcall(function() ParryCountLabel:SetText("Parries this session: 0") end)
 end)
 
+-- ── Visuals (v9.4.5) ──
+VisualsSec:Info("Health displays — toggle on/off independently")
+UIRefs.PersonalHP = VisualsSec:Toggle("Personal HP", false, function(v)
+    CFG.PersonalHP = v
+    if v then buildPersonalHP() else cleanupPersonalHP() end
+end)
+VisualsSec:Info("Small local health bar at the bottom of your screen")
+UIRefs.OpponentHP = VisualsSec:Toggle("Opponent HP", false, function(v)
+    CFG.OpponentHP = v
+    if not v then clearAllOpponentHPBars() end
+end)
+UIRefs.HPViewRange = VisualsSec:Slider("HP View Range",75,1,10,200,"studs",function(v)
+    CFG.HPViewRange = tonumber(v) or 75
+end)
+UIRefs.HPViewRange:Set(75)
+VisualsSec:Info("Opponent bars appear within this distance")
+
+-- ── Performance (v9.4.5) ──
+PerfSec:Info("Suppresses visual overlays — AP keeps running")
+UIRefs.LowLagMode = PerfSec:Toggle("Low Lag Mode", false, function(v)
+    CFG.LowLagMode = v
+    if v then clearAllOpponentHPBars() end
+end)
+PerfSec:Info("Hides opponent HP bars. Personal HP remains unless toggled off.")
+
 -- update counter in cycle
-local _origCycle = cycleTargets
 local _lastCountUpdate = 0
 OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
     local now2 = os.clock()
@@ -2201,22 +2979,102 @@ end))
 
 local UpdatesSec = UpdatesTab:Section("UPDATES","Left")
 local SoonSec    = UpdatesTab:Section("COMING SOON","Right")
-UpdatesSec:Info("5 New styles added")
+
+-- ── v9.4.5 ──
+UpdatesSec:Divider("v9.4.5 — Techs + Visuals Pack")
+UpdatesSec:Info("Added")
+UpdatesSec:Label("Anti Feint — releases F if attack cancels pre-parry")
+UpdatesSec:Label("Crit Defense — 50/50 F/Q on Heavy/M2 (overrides AutoDodge)")
+UpdatesSec:Label("Wing Chun Fake Wiff — rotates away + fires M1 to bait counter")
+UpdatesSec:Label("Shadow Step (Z) / Shadow Crit (B) — rapid F+Q taps")
+UpdatesSec:Label("Personal HP — compact health bar at screen bottom")
+UpdatesSec:Label("Opponent HP — billboard bars over nearby players")
+UpdatesSec:Label("HP View Range slider (1–200 studs)")
+UpdatesSec:Label("Low Lag Mode — suppresses visual overlays")
+UpdatesSec:Label("New tab: Techs")
+UpdatesSec:Label("New Settings sections: Visuals + Performance")
+UpdatesSec:Info("All v9.4.5 keys persist in Save + Share payloads")
+
+-- ── v9.4.4 ──
+UpdatesSec:Divider("v9.4.4 — FPS Pass")
+UpdatesSec:Info("Added")
+UpdatesSec:Label("Menu auto-perf — tweens OFF when menu hidden (RightShift)")
+UpdatesSec:Label("Full INS animations restored when menu is visible")
+UpdatesSec:Info("Changed")
+UpdatesSec:Label("Live BlockStart recompute throttled to every 3rd RS frame")
+UpdatesSec:Label("cycleTargets sort comparator hoisted (no closure realloc)")
+UpdatesSec:Label("HB local anim scan early-exits when AP disabled")
+UpdatesSec:Info("Zero AP delta — all pure performance work")
+
+-- ── v9.4.3 ──
+UpdatesSec:Divider("v9.4.3 — Consistency + Sharing")
+UpdatesSec:Info("Added — AP consistency (silent, always-on)")
+UpdatesSec:Label("Live BlockStart recompute — tracks ping drift mid-windup")
+UpdatesSec:Label("Movement bias — speed > 20 studs/s shifts fire -15ms")
+UpdatesSec:Label("Walk bias — speed > 8 studs/s shifts fire -8ms")
+UpdatesSec:Label("Ping-jitter window expansion (bounded ±25ms shift)")
+UpdatesSec:Label("Early-exit RS AP eval on LocalStunned")
+UpdatesSec:Info("Added — Config sharing (Profiles tab)")
+UpdatesSec:Label("Export to Clipboard")
+UpdatesSec:Label("Import from Clipboard")
+UpdatesSec:Label("Import from URL (gist/pastebin raw)")
+UpdatesSec:Info("Changed")
+UpdatesSec:Label("Menu: dropped SetPerformance(true) — animations restored")
+UpdatesSec:Label("Reduced theme-reapply stacking (5 → 3)")
+UpdatesSec:Label("Local anim-state scan moved from RS to Heartbeat")
+
+-- ── v9.4.2 ──
+UpdatesSec:Divider("v9.4.2 — Cleanup Pass")
+UpdatesSec:Info("Removed (dead code)")
+UpdatesSec:Label("_defer function (never called)")
+UpdatesSec:Label("_origCycle variable (never referenced)")
+UpdatesSec:Label("PlayersSvc fallback branch (unreachable)")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("FacingThreshold = 0 now loads from profile (was silently skipped)")
+UpdatesSec:Label("AutoHeight + HeightInfluence persist on save/reload")
+UpdatesSec:Label("Cleanup nil-guard on empty connections table")
+UpdatesSec:Info("Optimized")
+UpdatesSec:Label("Ping cache @ 10Hz (was per-registry-create)")
+UpdatesSec:Label("Height cache (weak-keyed per character)")
+UpdatesSec:Label("Rhythm KeyByte precomputed in ReceptorXMap")
+UpdatesSec:Label("pairs → ipairs on Lanes:GetChildren")
+UpdatesSec:Label("tostring(char) hoisted from inner anim loop")
+UpdatesSec:Label("cycleTargets arrays hoisted to module locals")
+UpdatesSec:Label("Facing-dot pcall unwrapped (pure math)")
+UpdatesSec:Label("IsHeavy helper (de-dup from 2 inline copies)")
+UpdatesSec:Info("Hardened")
+UpdatesSec:Label("BlockStart/BlockEnd/Dodge forward-declared (de-leaked from _G)")
+UpdatesSec:Label("RhythmAutoHitTick made local (de-leaked from _G)")
+UpdatesSec:Label("UnknownLog capped at 500 entries")
+
+-- ── Styles ──
+UpdatesSec:Divider("Styles")
+UpdatesSec:Info("5 styles added")
 UpdatesSec:Label("??? — Perfect Copy")
 UpdatesSec:Label("Epic — Aikido")
 UpdatesSec:Label("Uncommon — Taijutsu")
 UpdatesSec:Label("Uncommon — Hikaken")
 UpdatesSec:Label("Uncommon — Giovanna")
-UpdatesSec:Divider("Notes")
+UpdatesSec:Divider("Style Notes")
 UpdatesSec:Info("Aikido M2 is a counter (like Wing Chun). Force-parried — never auto-dodged.")
 UpdatesSec:Label("Timing sliders: 0.001 step (thousandths)")
 UpdatesSec:Label("Kyokushin M2 id updated (+80822959210741)")
+
+-- ── Coming Soon ──
 SoonSec:Info("Planned")
 SoonSec:Label("Auto Combo (M1 after parry)")
 SoonSec:Label("Health-Safe Targeting")
 SoonSec:Label("Style Detection Display")
 SoonSec:Label("Snap Lock")
 SoonSec:Label("Profile Quick-Switch keybind")
+SoonSec:Label("X Target (manual target lock)")
+SoonSec:Label("Timing Learner (auto-tune via trials)")
+SoonSec:Label("Record Test Logs")
+SoonSec:Label("Auto R (universal auto-crit)")
+SoonSec:Label("Damage Logs")
+SoonSec:Label("Named Configs polish")
+SoonSec:Label("Add unknowns to ignore list (one-click)")
+
 SoonSec:Divider("Credit")
 SoonSec:Info("Made By Fgonzxlez")
 
@@ -2227,9 +3085,16 @@ local UIS = game:GetService("UserInputService")
 OlympusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
     if not OlympusState.Alive then return end
     if gpe then return end
-    if inp.UserInputType == Enum.UserInputType.Keyboard
-        and inp.KeyCode == Enum.KeyCode.RightShift then
-        menuOpen = not menuOpen
+    if inp.UserInputType == Enum.UserInputType.Keyboard then
+        if inp.KeyCode == Enum.KeyCode.RightShift then
+            menuOpen = not menuOpen
+            menuVisible = not menuVisible
+            syncMenuPerformance()
+        elseif CFG.ShadowStep and inp.KeyCode == Enum.KeyCode.Z then
+            task.spawn(doShadowSequence)
+        elseif CFG.ShadowCrit and inp.KeyCode == Enum.KeyCode.B then
+            task.spawn(doShadowSequence)
+        end
     end
 end))
 
@@ -2238,5 +3103,13 @@ setMenuInput(false)
 pcall(function() setrobloxinput(true) end)
 
 pcall(function() OlympusState.UI_Window = UI_Window end)
-UI_Library:Notify("Olympus","v9.4.1 | Source-identical AP core")
-print("[Olympus v9.4.1] AP core matches lolbeans67: BlockStart(regData.BlockStart), ReleaseDeadline=StartTime+Hold, ConstLatency 0.018, continuous window, EXECUTE_DEBOUNCE 0.5, facing 0.1")
+
+-- Re-apply after INS config autosave settles. One deferred catch is enough —
+-- stacking multiple delayed reapplies caused drag frame-stutter.
+applyMenuBackground()
+applyDarkTheme()
+syncMenuPerformance()  -- initial perf state matches initial menu visibility
+task.defer(function() applyMenuBackground() applyDarkTheme() end)
+task.delay(1.0, function() applyMenuBackground() applyDarkTheme() end)
+UI_Library:Notify("Olympus","v9.4.5 | Techs + Visuals pack")
+print("[Olympus v9.4.5] AntiFeint | CritDefense | WC FakeWiff | Shadow Z/B | Personal+Opponent HP | LowLag")
