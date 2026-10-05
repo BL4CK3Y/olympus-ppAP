@@ -1,5 +1,9 @@
 -- =============================================
--- Olympus Auto Parry — v9.4.3
+-- Syndicatus Auto Parry — v9.4.3 base, rebranded in v9.4.8
+-- (lineage history retains the Olympus name on versions where that was its name)
+-- =============================================
+--
+-- Original name: Olympus Auto Parry — v9.4.3
 -- + Open-source registry + continuous window (lolbeans style)
 -- + ConstLatency start-time, loop re-arm, consistent PARRYING
 -- + Ping compensation, Parry Window, Probability
@@ -41,31 +45,51 @@
 --   * Personal HP — compact health bar at screen bottom
 --   * Opponent HP — billboard bars over nearby players (gated by HP View Range)
 --   * Low Lag Mode — suppresses visual overlays when on
+-- v9.4.6 fix pass:
+--   * Personal + Opponent HP: parent to gethui()/CoreGui proxy (survives game sanitization)
+--     + protect_gui calls where executor supports it
+--   * ParryHold + ParryWindow sliders REMOVED — hard-locked to source defaults
+--     (Hold=0.27s, Window=0.20s). Legacy save profiles can no longer override these.
+-- v9.4.7 strip pass:
+--   * Visuals section fully removed (Personal HP, Opponent HP, HP View Range, Low Lag Mode)
+--     game has native HP displays — redundant surface area, zero benefit
+--   * Performance section removed (Low Lag only gated HP — nothing left to gate)
+--   * Facing Threshold slider removed — hard-locked to source default 0.1
+--     (source constant, not a tunable; exposing it caused "AP broken" reports)
+--   * All related CFG keys, applySettings branches, save payload entries purged
+-- v9.4.8 rebrand:
+--   * Olympus → Syndicatus everywhere (UI title, notifies, print tags, internal identifiers)
+--   * _G.__OlympusAP → _G.__SyndicatusAP (legacy key also cleaned on upgrade)
+--   * PROFILE_FOLDER "Olympus" → "Syndicatus" (NOTE: old profiles stay in Olympus/ folder;
+--     move them manually or re-save under the new name)
+--   * INS config autosave key renamed (menu layout resets once on upgrade — one-time)
+--   * External GitHub asset URL kept as-is (not ours)
+--   * Share format tag updated; import still accepts legacy "olympus-share-v1"
 -- =============================================
 
--- Cleanup previous inject
+-- Cleanup previous inject — handle both the new _G key and the legacy one (v9.4.7 and earlier)
 pcall(function()
+    if _G.__SyndicatusAP and _G.__SyndicatusAP.Cleanup then
+        _G.__SyndicatusAP:Cleanup()
+    end
     if _G.__OlympusAP and _G.__OlympusAP.Cleanup then
         _G.__OlympusAP:Cleanup()
+        _G.__OlympusAP = nil
     end
 end)
 
--- v9.4.5 — forward-declare HP teardown functions BEFORE OlympusState:Cleanup definition
--- so the Cleanup body binds to this local slot (not _ENV globals, which would be nil forever).
-local cleanupPersonalHP, clearAllOpponentHPBars
-
-local OlympusState = {
+local SyndicatusState = {
     Alive = true,
     Connections = {},
 }
-_G.__OlympusAP = OlympusState
+_G.__SyndicatusAP = SyndicatusState
 
-function OlympusState:AddConnection(c)
+function SyndicatusState:AddConnection(c)
     if c then table.insert(self.Connections, c) end
     return c
 end
 
-function OlympusState:Cleanup()
+function SyndicatusState:Cleanup()
     self.Alive = false
     if self.Connections then
         for _, c in ipairs(self.Connections) do
@@ -73,17 +97,12 @@ function OlympusState:Cleanup()
         end
         table.clear(self.Connections)
     end
-    -- v9.4.5 — tear down HP GUIs on unload
-    pcall(function()
-        if cleanupPersonalHP then cleanupPersonalHP() end
-        if clearAllOpponentHPBars then clearAllOpponentHPBars() end
-    end)
     pcall(function()
         if self.UI_Window and self.UI_Window.Destroy then
             self.UI_Window:Destroy()
         end
     end)
-    print("[Olympus] Cleaned up previous session")
+    print("[Syndicatus] Cleaned up previous session")
 end
 
 -- Services
@@ -847,11 +866,12 @@ do
             FlatConfig[id].ReactionTime = info.ReactionTime
         end
     end
-    print("[Olympus] Godzz + new-style defaults applied (" .. n .. " timings)")
+    print("[Syndicatus] Godzz + new-style defaults applied (" .. n .. " timings)")
 end
 
 -- ── Multi-Config ────────────────────────────
-local PROFILE_FOLDER = "Olympus"
+local PROFILE_FOLDER = "Syndicatus"
+local LEGACY_PROFILE_FOLDER = "Olympus"  -- v9.4.8: fallback for pre-rebrand saves
 local GAKURAN_FOLDER = "GakuranConfigs"
 local profileSourceMap = {}
 
@@ -874,6 +894,23 @@ local function listProfiles()
         if n then
             table.insert(names, n)
             profileSourceMap[n] = { format = "json", path = s }
+        end
+    end
+    -- v9.4.8: also enumerate the pre-rebrand Olympus/ folder; marked with [L] prefix so
+    -- users can see what's legacy and re-save under a clean name if they want
+    if isfolder and isfolder(LEGACY_PROFILE_FOLDER) then
+        local lfiles = {}
+        pcall(function() lfiles = listfiles(LEGACY_PROFILE_FOLDER) or {} end)
+        for _, f in pairs(lfiles) do
+            local s = tostring(f)
+            local n = s:match("([^/\\]+)%.json$")
+            if n then
+                local d = "[L] " .. n
+                if not profileSourceMap[n] and not profileSourceMap[d] then
+                    table.insert(names, d)
+                    profileSourceMap[d] = { format = "json", path = s }
+                end
+            end
         end
     end
     if isfolder and isfolder(GAKURAN_FOLDER) then
@@ -946,14 +983,11 @@ local CFG = {
     AutoRespawn=false, RespawnDelay=1.5,
     TargetFacingYou=false, YouFacingTarget=true,
     FacingThreshold=0.1,  -- matches open-source (0.1); 0.5 ≈ 60° cone
-    -- v9.4.5 feature pack
+    -- v9.4.5 feature pack (v9.4.7: HP/LowLag stripped — game has native HP)
     AntiFeint=false,
     CritDefense=false,
     WCFakeWiff=false, WCFakeWiffTime=0.18,
     ShadowStep=false, ShadowCrit=false,
-    PersonalHP=false,
-    OpponentHP=false, HPViewRange=75,
-    LowLagMode=false,
 }
 
 local ParryKey = string.byte("F")
@@ -1128,7 +1162,7 @@ local function doWCFakeWiff(targetChar)
             local lookTarget = hrp.Position + origCFrame.LookVector * 10
             hrp.CFrame = CFrame.new(hrp.Position, lookTarget)
         end)
-        if not ok and CFG.Debug then print("[Olympus] WC Fake Wiff failed") end
+        if not ok and CFG.Debug then print("[Syndicatus] WC Fake Wiff failed") end
         WCFakeWiffActive = false
     end)
 end
@@ -1138,210 +1172,6 @@ end
 local AntiFeintTarget = nil  -- regData reference
 local AntiFeintFireTime = 0
 
--- ── v9.4.5 Personal HP bar ──
-local personalHPState = { gui = nil, connections = {} }
-
-function cleanupPersonalHP()
-    for _, c in ipairs(personalHPState.connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    table.clear(personalHPState.connections)
-    if personalHPState.gui then
-        pcall(function() personalHPState.gui:Destroy() end)
-        personalHPState.gui = nil
-    end
-end
-
-local function buildPersonalHP()
-    cleanupPersonalHP()
-    local okBuild = pcall(function()
-        local gui = Instance.new("ScreenGui")
-        gui.Name = "OlympusPersonalHP"
-        gui.ResetOnSpawn = false
-        gui.IgnoreGuiInset = true
-        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-        gui.Parent = LocalPlayer:WaitForChild("PlayerGui", 5)
-
-        local frame = Instance.new("Frame")
-        frame.Size = UDim2.new(0, 220, 0, 14)
-        frame.Position = UDim2.new(0.5, -110, 1, -50)
-        frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-        frame.BackgroundTransparency = 0.3
-        frame.BorderSizePixel = 0
-        frame.Parent = gui
-
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 3)
-        corner.Parent = frame
-
-        local fill = Instance.new("Frame")
-        fill.Name = "Fill"
-        fill.Size = UDim2.new(1, 0, 1, 0)
-        fill.BackgroundColor3 = Color3.fromRGB(60, 180, 40)
-        fill.BorderSizePixel = 0
-        fill.Parent = frame
-
-        local fillCorner = Instance.new("UICorner")
-        fillCorner.CornerRadius = UDim.new(0, 3)
-        fillCorner.Parent = fill
-
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1, 0, 1, 0)
-        label.BackgroundTransparency = 1
-        label.Text = "— / —"
-        label.TextColor3 = Color3.fromRGB(255, 255, 255)
-        label.TextStrokeTransparency = 0.4
-        label.Font = Enum.Font.GothamBold
-        label.TextSize = 11
-        label.ZIndex = 2
-        label.Parent = frame
-
-        personalHPState.gui = gui
-
-        local function hookHumanoid(hum)
-            if not hum then return end
-            local function refresh()
-                if not personalHPState.gui or not personalHPState.gui.Parent then return end
-                local hp = math.max(0, hum.Health)
-                local maxHp = math.max(1, hum.MaxHealth)
-                local ratio = math.clamp(hp / maxHp, 0, 1)
-                fill.Size = UDim2.new(ratio, 0, 1, 0)
-                fill.BackgroundColor3 = Color3.fromRGB(
-                    math.floor(210 * (1 - ratio) + 60 * ratio),
-                    math.floor(40 * (1 - ratio) + 180 * ratio),
-                    40
-                )
-                label.Text = string.format("%d / %d", math.floor(hp + 0.5), math.floor(maxHp + 0.5))
-            end
-            refresh()
-            table.insert(personalHPState.connections, hum.HealthChanged:Connect(refresh))
-            table.insert(personalHPState.connections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
-        end
-
-        local function onCharacter(char)
-            if not char then return end
-            local hum = char:FindFirstChildWhichIsA("Humanoid") or char:WaitForChild("Humanoid", 3)
-            hookHumanoid(hum)
-        end
-
-        if LocalPlayer.Character then onCharacter(LocalPlayer.Character) end
-        table.insert(personalHPState.connections, LocalPlayer.CharacterAdded:Connect(onCharacter))
-    end)
-    if not okBuild then cleanupPersonalHP() end
-end
-
--- ── v9.4.5 Opponent HP bars ──
-local opponentHPBars = {}  -- [player] = { gui, fill, label }
-
-local function removeOpponentHPBar(player)
-    local b = opponentHPBars[player]
-    if b then
-        pcall(function() if b.gui then b.gui:Destroy() end end)
-        opponentHPBars[player] = nil
-    end
-end
-
-function clearAllOpponentHPBars()
-    for p, _ in pairs(opponentHPBars) do removeOpponentHPBar(p) end
-end
-
-local function ensureOpponentHPBar(player)
-    local existing = opponentHPBars[player]
-    if existing and existing.gui and existing.gui.Parent then return existing end
-    if existing then removeOpponentHPBar(player) end
-    local char = player.Character
-    if not char then return nil end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local hum = char:FindFirstChildWhichIsA("Humanoid")
-    if not hrp or not hum then return nil end
-
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name = "OlympusHP_" .. player.Name
-    billboard.Size = UDim2.new(0, 110, 0, 22)
-    billboard.StudsOffset = Vector3.new(0, 3.2, 0)
-    billboard.AlwaysOnTop = true
-    billboard.Adornee = hrp
-    billboard.Parent = hrp
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(1, 0, 1, 0)
-    frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    frame.BackgroundTransparency = 0.4
-    frame.BorderSizePixel = 0
-    frame.Parent = billboard
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 3)
-    corner.Parent = frame
-
-    local fill = Instance.new("Frame")
-    fill.Name = "Fill"
-    fill.Size = UDim2.new(1, 0, 1, 0)
-    fill.BackgroundColor3 = Color3.fromRGB(60, 180, 40)
-    fill.BorderSizePixel = 0
-    fill.Parent = frame
-
-    local fillCorner = Instance.new("UICorner")
-    fillCorner.CornerRadius = UDim.new(0, 3)
-    fillCorner.Parent = fill
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, 0, 1, 0)
-    label.BackgroundTransparency = 1
-    label.Text = player.Name
-    label.TextColor3 = Color3.fromRGB(255, 255, 255)
-    label.TextStrokeTransparency = 0.3
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 11
-    label.ZIndex = 2
-    label.Parent = frame
-
-    opponentHPBars[player] = { gui = billboard, fill = fill, label = label, hum = hum, hrp = hrp }
-    return opponentHPBars[player]
-end
-
-local function updateOpponentHPBars()
-    if not CFG.OpponentHP or CFG.LowLagMode then
-        if next(opponentHPBars) then clearAllOpponentHPBars() end
-        return
-    end
-    local lc = LocalPlayer.Character
-    local lr = lc and lc:FindFirstChild("HumanoidRootPart")
-    if not lr then clearAllOpponentHPBars() return end
-
-    local viewRange = tonumber(CFG.HPViewRange) or 75
-    local seen = {}
-    pcall(function()
-        for _, p in ipairs(PlayersSvc:GetPlayers()) do
-            if p ~= LocalPlayer and p.Character then
-                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-                local hum = p.Character:FindFirstChildWhichIsA("Humanoid")
-                if hrp and hum and hum.Health > 0 then
-                    local d = (lr.Position - hrp.Position).Magnitude
-                    if d <= viewRange then
-                        seen[p] = true
-                        local bar = ensureOpponentHPBar(p)
-                        if bar and bar.hum and bar.hum.Parent then
-                            local hp = math.max(0, bar.hum.Health)
-                            local maxHp = math.max(1, bar.hum.MaxHealth)
-                            local ratio = math.clamp(hp / maxHp, 0, 1)
-                            bar.fill.Size = UDim2.new(ratio, 0, 1, 0)
-                            bar.fill.BackgroundColor3 = Color3.fromRGB(
-                                math.floor(210 * (1 - ratio) + 60 * ratio),
-                                math.floor(40 * (1 - ratio) + 180 * ratio),
-                                40
-                            )
-                            bar.label.Text = string.format("%s  %d", p.Name, math.floor(hp + 0.5))
-                        end
-                    end
-                end
-            end
-        end
-    end)
-    for p, _ in pairs(opponentHPBars) do
-        if not seen[p] then removeOpponentHPBar(p) end
-    end
-end
 
 -- Exact source formula:
 --   RT  -= half_ping (if ping comp)
@@ -1437,7 +1267,7 @@ local function ExecuteParry(regData, attackConfig)
             parryCount = parryCount + 1
         end
         if CFG.Debug then
-            print("[Olympus AP ForceParry]", attackConfig.Style, attackConfig.DisplayName)
+            print("[Syndicatus AP ForceParry]", attackConfig.Style, attackConfig.DisplayName)
         end
         return
     end
@@ -1459,7 +1289,7 @@ local function ExecuteParry(regData, attackConfig)
                 parryCount = parryCount + 1
             end
             if CFG.Debug then
-                print(string.format("[Olympus CritDefense] %s | %s",
+                print(string.format("[Syndicatus CritDefense] %s | %s",
                     tostring(attackConfig.Style), tostring(attackConfig.DisplayName)))
             end
             return
@@ -1490,7 +1320,7 @@ local function ExecuteParry(regData, attackConfig)
             end)
         end
         if CFG.Debug then
-            print(string.format("[Olympus AP] Block [%s | %s]",
+            print(string.format("[Syndicatus AP] Block [%s | %s]",
                 tostring(attackConfig.Style), tostring(attackConfig.DisplayName)))
         end
     elseif LastPendingRegData == regData then
@@ -1814,7 +1644,7 @@ end)
 
 -- ── MAIN LOOP — same AP path as source (RenderStepped, no rate limit) ──
 -- Non-AP utilities moved to a light Heartbeat so RS stays lean.
-OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
+SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
     local now = os.clock()
 
     -- Source ParryTask: release when past deadline
@@ -1853,7 +1683,7 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
         local anims = getAnims(c)
         if doDebug and (now - debugLastPrint) > 2 then
             debugLastPrint = now
-            print("[Olympus DEBUG] targets=" .. nTargets ..
+            print("[Syndicatus DEBUG] targets=" .. nTargets ..
                 " anims=" .. #anims .. " dist=" .. math.floor(dist))
             for ai = 1, #anims do
                 local a = anims[ai]
@@ -1871,7 +1701,7 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
                     local num = animId:match("%d+$") or animId:match("%d+")
                     if num then
                         UnknownOrder[#UnknownOrder + 1] = num
-                        print("[Olympus UNKNOWN]", animId)
+                        print("[Syndicatus UNKNOWN]", animId)
                     end
                 end
                 continue
@@ -1890,7 +1720,7 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
                     regData.FakeWiffDone = true
                     regData.Processed = true
                     doWCFakeWiff(c)
-                    if CFG.Debug then print("[Olympus] WC Fake Wiff triggered on", c.Name) end
+                    if CFG.Debug then print("[Syndicatus] WC Fake Wiff triggered on", c.Name) end
                 end
                 continue
             end
@@ -1961,7 +1791,7 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
                     BlockEnd()
                     AntiFeintTarget = nil
                     if CFG.Debug then
-                        print("[Olympus AntiFeint] released F — attack cancelled at " ..
+                        print("[Syndicatus AntiFeint] released F — attack cancelled at " ..
                             string.format("%.3fs", sinceFire))
                     end
                 end
@@ -1983,8 +1813,8 @@ OlympusState:AddConnection(RunService.RenderStepped:Connect(function()
 end))
 
 -- Light utility tick (not on RenderStepped — keeps AP frame clean)
-OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
-    if not OlympusState.Alive then return end
+SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
+    if not SyndicatusState.Alive then return end
     local now = os.clock()
 
     -- Ping cache refresh (10Hz) + jitter ring buffer update
@@ -2085,7 +1915,6 @@ OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
     if (now - lastCycle) >= 0.5 then
         lastCycle = now
         pcall(cycleTargets)
-        pcall(updateOpponentHPBars)  -- v9.4.5 — same cadence as target cycle
         if TargetLabel then
             pcall(function()
                 local names = {}
@@ -2101,7 +1930,7 @@ end))
 
 -- ── UI ──────────────────────────────────────
 if not UI_Library then
-    warn("[Olympus] UI library failed — AP still runs headless")
+    warn("[Syndicatus] UI library failed — AP still runs headless")
     menuOpen = false
     pcall(function() setrobloxinput(true) end)
     return
@@ -2119,7 +1948,7 @@ local function setMenuInput(open)
 end
 
 local UI_Window = UI_Library:CreateWindow({
-    title="Olympus",size=Vector2.new(740,580),configFolder="olympus_base",
+    title="Syndicatus",size=Vector2.new(740,580),configFolder="syndicatus_base",
     opacity = 1,
 })
 
@@ -2284,8 +2113,9 @@ local function applySettings(s)
     if s.CycleRange        then CFG.CycleRange=s.CycleRange   setSlider(UIRefs.CycleRange,s.CycleRange) end
     if s.APRange           then CFG.APRange=s.APRange         setSlider(UIRefs.APRange,s.APRange) end
     if s.ParryOffset ~=nil then CFG.ParryOffset=s.ParryOffset setSlider(UIRefs.ParryOffset,s.ParryOffset) end
-    if s.ParryHold         then CFG.ParryHold=s.ParryHold     setSlider(UIRefs.ParryHold,s.ParryHold) end
-    if s.ParryWindow       then CFG.ParryWindow=s.ParryWindow setSlider(UIRefs.ParryWindow,s.ParryWindow) end
+    -- v9.4.6: ParryHold + ParryWindow are hard-locked to source defaults. Legacy profiles
+    -- that stored custom values are intentionally ignored here — don't let a bad save poison
+    -- the AP timing. Users who want to tune these should modify CFG defaults in source.
     if s.ProbabilityToParry then CFG.ProbabilityToParry=s.ProbabilityToParry setSlider(UIRefs.ProbabilityToParry,s.ProbabilityToParry) end
     if s.PingCompensate  ~=nil then CFG.PingCompensate=s.PingCompensate setToggle(UIRefs.PingCompensate,s.PingCompensate) end
     if s.AutoTargetNearest~=nil then CFG.AutoTargetNearest=s.AutoTargetNearest setToggle(UIRefs.AutoTargetNearest,s.AutoTargetNearest) end
@@ -2293,7 +2123,7 @@ local function applySettings(s)
         -- facing conditions
     if s.TargetFacingYou ~=nil then CFG.TargetFacingYou=s.TargetFacingYou setToggle(UIRefs.TargetFacingYou,s.TargetFacingYou) end
     if s.YouFacingTarget ~=nil then CFG.YouFacingTarget=s.YouFacingTarget  setToggle(UIRefs.YouFacingTarget,s.YouFacingTarget) end
-    if s.FacingThreshold ~=nil then CFG.FacingThreshold=s.FacingThreshold  setSlider(UIRefs.FacingThreshold,s.FacingThreshold) end
+    -- v9.4.7: FacingThreshold hard-locked to 0.1 — legacy save values ignored
     if s.AutoHeight      ~=nil then CFG.AutoHeight=s.AutoHeight            setToggle(UIRefs.AutoHeight,s.AutoHeight) end
     if s.HeightInfluence ~=nil then CFG.HeightInfluence=s.HeightInfluence  setSlider(UIRefs.HeightInfluence,s.HeightInfluence) end
     -- v9.4.5 feature pack
@@ -2303,22 +2133,7 @@ local function applySettings(s)
     if s.WCFakeWiffTime      then CFG.WCFakeWiffTime=s.WCFakeWiffTime   setSlider(UIRefs.WCFakeWiffTime,s.WCFakeWiffTime) end
     if s.ShadowStep    ~=nil then CFG.ShadowStep=s.ShadowStep           setToggle(UIRefs.ShadowStep,s.ShadowStep) end
     if s.ShadowCrit    ~=nil then CFG.ShadowCrit=s.ShadowCrit           setToggle(UIRefs.ShadowCrit,s.ShadowCrit) end
-    if s.PersonalHP    ~=nil then
-        CFG.PersonalHP=s.PersonalHP
-        setToggle(UIRefs.PersonalHP,s.PersonalHP)
-        if s.PersonalHP then buildPersonalHP() else cleanupPersonalHP() end
-    end
-    if s.OpponentHP    ~=nil then
-        CFG.OpponentHP=s.OpponentHP
-        setToggle(UIRefs.OpponentHP,s.OpponentHP)
-        if not s.OpponentHP then clearAllOpponentHPBars() end
-    end
-    if s.HPViewRange         then CFG.HPViewRange=s.HPViewRange         setSlider(UIRefs.HPViewRange,s.HPViewRange) end
-    if s.LowLagMode    ~=nil then
-        CFG.LowLagMode=s.LowLagMode
-        setToggle(UIRefs.LowLagMode,s.LowLagMode)
-        if s.LowLagMode then clearAllOpponentHPBars() end
-    end
+    -- v9.4.7: PersonalHP/OpponentHP/HPViewRange/LowLagMode stripped — ignored silently from legacy saves
     -- misc
     if s.SoundOnParry    ~=nil then CFG.SoundOnParry=s.SoundOnParry end
     if s.AntiAFK         ~=nil then CFG.AntiAFK=s.AntiAFK                 setToggle(UIRefs.AntiAFK,s.AntiAFK) end
@@ -2377,18 +2192,15 @@ ProfilesSec:Button("Save Current",function()
             Debug=CFG.Debug,
             -- facing conditions
             TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
-            FacingThreshold=CFG.FacingThreshold,
             -- height
             AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
             -- v9.4.5 feature pack
             AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
             WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
             ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
-            PersonalHP=CFG.PersonalHP, OpponentHP=CFG.OpponentHP, HPViewRange=CFG.HPViewRange,
-            LowLagMode=CFG.LowLagMode,
             -- ranges + timing
             CycleRange=CFG.CycleRange, APRange=CFG.APRange,
-            ParryOffset=CFG.ParryOffset, ParryHold=CFG.ParryHold, ParryWindow=CFG.ParryWindow,
+            ParryOffset=CFG.ParryOffset,  -- Hold+Window hard-locked; not saved
             ProbabilityToParry=CFG.ProbabilityToParry,
             PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
             RhythmAutoHit=CFG.RhythmAutoHit,
@@ -2403,7 +2215,7 @@ ProfilesSec:Button("Save Current",function()
     }
     local savedPath = saveProfile(name,payload)
     if not savedPath then UI_Library:Notify("Profiles","Save FAILED") return end
-    print("[Olympus] Saved profile", name, "APKeybind=", CFG.APKeybind)
+    print("[Syndicatus] Saved profile", name, "APKeybind=", CFG.APKeybind)
     selectedConfig = name
     pcall(function() NameLabel:SetText("Will save as: "..name) end)
     refreshDrop()
@@ -2488,22 +2300,19 @@ local function buildSharePayload()
     local t = {}
     for id, info in pairs(GameConfig) do t[id] = info.ReactionTime or DefaultRT end
     return {
-        _format = "olympus-share-v1",
+        _format = "syndicatus-share-v1",  -- importer accepts legacy "olympus-share-v1" too
         Timings = t,
         Settings = {
             Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
             MultiTarget=CFG.MultiTarget, Debug=CFG.Debug,
             TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
-            FacingThreshold=CFG.FacingThreshold,
             AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
             -- v9.4.5 feature pack
             AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
             WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
             ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
-            PersonalHP=CFG.PersonalHP, OpponentHP=CFG.OpponentHP, HPViewRange=CFG.HPViewRange,
-            LowLagMode=CFG.LowLagMode,
             CycleRange=CFG.CycleRange, APRange=CFG.APRange,
-            ParryOffset=CFG.ParryOffset, ParryHold=CFG.ParryHold, ParryWindow=CFG.ParryWindow,
+            ParryOffset=CFG.ParryOffset,  -- Hold+Window hard-locked; not saved
             ProbabilityToParry=CFG.ProbabilityToParry,
             PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
             RhythmAutoHit=CFG.RhythmAutoHit,
@@ -2560,7 +2369,7 @@ ProfilesSec:Button("Import from Clipboard", function()
     end
     local okJ, data = pcall(function() return HttpService:JSONDecode(text) end)
     if not okJ or type(data) ~= "table" then
-        UI_Library:Notify("Share", "Clipboard isn't valid Olympus JSON")
+        UI_Library:Notify("Share", "Clipboard isn't valid Syndicatus JSON")
         return
     end
     local tApplied, tMissing, sApplied = applyShared(data)
@@ -2596,7 +2405,7 @@ ProfilesSec:Button("Fetch & Load URL", function()
     end
     local okJ, data = pcall(function() return HttpService:JSONDecode(body) end)
     if not okJ or type(data) ~= "table" then
-        UI_Library:Notify("Share", "URL did not return valid Olympus JSON")
+        UI_Library:Notify("Share", "URL did not return valid Syndicatus JSON")
         return
     end
     local tApplied, tMissing, sApplied = applyShared(data)
@@ -2660,11 +2469,11 @@ writeAPKeybind = function(key)
 end
 
 -- Sync CFG from pill so Save always has the current key
-OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
-    if not OlympusState.Alive then return end
+SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
+    if not SyndicatusState.Alive then return end
     local t = os.clock()
-    if (OlympusState._lastKbSync or 0) + 0.5 > t then return end
-    OlympusState._lastKbSync = t
+    if (SyndicatusState._lastKbSync or 0) + 0.5 > t then return end
+    SyndicatusState._lastKbSync = t
     pcall(function()
         if APToggleElement and APToggleElement.Bind then
             local k = APToggleElement.Bind.Value
@@ -2682,9 +2491,9 @@ end))
 CondSec:Info("Gate parry per target based on facing direction")
 UIRefs.TargetFacingYou=CondSec:Toggle("Target facing you",false,function(v) CFG.TargetFacingYou=v end)
 UIRefs.YouFacingTarget=CondSec:Toggle("You facing target",true,function(v) CFG.YouFacingTarget=v end)
-UIRefs.FacingThreshold=CondSec:Slider("Facing Angle",0.1,0.05,0,1,"dot",function(v) CFG.FacingThreshold=tonumber(v) or 0.1 end)
-UIRefs.FacingThreshold:Set(CFG.FacingThreshold)
-CondSec:Info("Source uses 0.1 | 0=any | 0.5=60° | 0.7=45° | 1.0=dead-on")
+-- v9.4.7: Facing Angle slider removed. Source uses 0.1 as a constant threshold.
+-- Still read from CFG.FacingThreshold (locked at init) so the condition toggles above still work.
+CondSec:Info("Facing angle locked to source default (0.1 dot)")
 UIRefs.AutoHeight = CondSec:Toggle("Automatic Height Timing", true, function(v) CFG.AutoHeight = v end)
 UIRefs.HeightInfluence = CondSec:Slider("Height Influence", 1, 0.05, 0, 2, "x", function(v) CFG.HeightInfluence = tonumber(v) or 1 end)
 UIRefs.HeightInfluence:Set(1)
@@ -2702,15 +2511,14 @@ UIRefs.Debug = EngineSec:Toggle("Debug Parry",false,function(v)
 end)
 UIRefs.ParryOffset = EngineSec:Slider("Parry Offset",0,0.001,-0.15,0.15,"s",function(v) CFG.ParryOffset=tonumber(v) or 0 end)
 UIRefs.ParryOffset:Set(0)
-UIRefs.ParryHold = EngineSec:Slider("Parry Hold",0.27,0.001,0.05,0.8,"s",function(v) CFG.ParryHold=tonumber(v) or 0.27 end)
-UIRefs.ParryHold:Set(0.27)
-UIRefs.ParryWindow = EngineSec:Slider("Parry Window",0.20,0.001,0,1,"s",function(v) CFG.ParryWindow=tonumber(v) or 0.20 end)
-UIRefs.ParryWindow:Set(0.20)
+-- Parry Hold (0.27s) and Parry Window (0.20s) are hard-locked to source defaults.
+-- These are source-constants not meant for user tuning; exposing them historically caused
+-- misconfigured ACs to blame the script. See CFG.ParryHold / CFG.ParryWindow.
 UIRefs.ProbabilityToParry = EngineSec:Slider("Probability To Parry",100,1,1,100,"%",function(v) CFG.ProbabilityToParry=tonumber(v) or 100 end)
 UIRefs.ProbabilityToParry:Set(100)
 UIRefs.PingCompensate = EngineSec:Toggle("Ping Compensation", true, function(v) CFG.PingCompensate=v end)
 EngineSec:Info("Ping Comp subtracts half your ping from reaction time.")
-EngineSec:Info("Window = how long after ideal fire time a parry is still accepted.")
+EngineSec:Info("Hold=0.27s / Window=0.20s locked to source defaults.")
 EngineSec:Info("v9.4 uses open-source continuous registry (no global CD).")
 
 DebugSec:Label("Enable Debug Parry to see prints + notifs")
@@ -2879,8 +2687,6 @@ local MiscSec     = SettingsTab:Section("Misc","Left")
 local AntiAFKSec  = SettingsTab:Section("Anti-AFK","Left")
 local RespawnSec  = SettingsTab:Section("Auto Respawn","Right")
 local SessionSec  = SettingsTab:Section("Session","Right")
-local VisualsSec  = SettingsTab:Section("Visuals","Left")
-local PerfSec     = SettingsTab:Section("Performance","Right")
 
 
 -- Misc
@@ -2894,15 +2700,15 @@ UIRefs.RhythmAutoHit = MiscSec:Toggle("Rhythm Auto-Hit", false, function(v)
     UI_Library:Notify("Rhythm Auto-Hit", v and "ON — set keys to Z X , . (4) or F J (2)" or "OFF")
 end)
 MiscSec:Info("Requires Gakuran keybinds: 4-lane = Z X Comma Period | 2-lane = F J")
-MiscSec:Button("Unload Olympus",function()
+MiscSec:Button("Unload Syndicatus",function()
     pcall(function()
-        if _G.__OlympusAP and _G.__OlympusAP.Cleanup then
-            _G.__OlympusAP:Cleanup()
+        if _G.__SyndicatusAP and _G.__SyndicatusAP.Cleanup then
+            _G.__SyndicatusAP:Cleanup()
         else
             UI_Window:Destroy()
         end
     end)
-    print("[Olympus] Unloaded")
+    print("[Syndicatus] Unloaded")
 end)
 
 -- Anti-AFK
@@ -2942,34 +2748,9 @@ SessionSec:Button("Reset Counter",function()
     pcall(function() ParryCountLabel:SetText("Parries this session: 0") end)
 end)
 
--- ── Visuals (v9.4.5) ──
-VisualsSec:Info("Health displays — toggle on/off independently")
-UIRefs.PersonalHP = VisualsSec:Toggle("Personal HP", false, function(v)
-    CFG.PersonalHP = v
-    if v then buildPersonalHP() else cleanupPersonalHP() end
-end)
-VisualsSec:Info("Small local health bar at the bottom of your screen")
-UIRefs.OpponentHP = VisualsSec:Toggle("Opponent HP", false, function(v)
-    CFG.OpponentHP = v
-    if not v then clearAllOpponentHPBars() end
-end)
-UIRefs.HPViewRange = VisualsSec:Slider("HP View Range",75,1,10,200,"studs",function(v)
-    CFG.HPViewRange = tonumber(v) or 75
-end)
-UIRefs.HPViewRange:Set(75)
-VisualsSec:Info("Opponent bars appear within this distance")
-
--- ── Performance (v9.4.5) ──
-PerfSec:Info("Suppresses visual overlays — AP keeps running")
-UIRefs.LowLagMode = PerfSec:Toggle("Low Lag Mode", false, function(v)
-    CFG.LowLagMode = v
-    if v then clearAllOpponentHPBars() end
-end)
-PerfSec:Info("Hides opponent HP bars. Personal HP remains unless toggled off.")
-
 -- update counter in cycle
 local _lastCountUpdate = 0
-OlympusState:AddConnection(RunService.Heartbeat:Connect(function()
+SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
     local now2 = os.clock()
     if (now2-_lastCountUpdate) > 1 then
         _lastCountUpdate=now2
@@ -2979,6 +2760,37 @@ end))
 
 local UpdatesSec = UpdatesTab:Section("UPDATES","Left")
 local SoonSec    = UpdatesTab:Section("COMING SOON","Right")
+
+-- ── v9.4.8 ──
+UpdatesSec:Divider("v9.4.8 — Rebrand")
+UpdatesSec:Info("Changed")
+UpdatesSec:Label("Olympus → Syndicatus (title, notifies, print tags, identifiers)")
+UpdatesSec:Label("_G._SyndicatusAP (legacy _G._OlympusAP cleaned on upgrade)")
+UpdatesSec:Label("Profiles save to Syndicatus/ folder")
+UpdatesSec:Label("Share format tag updated — importer still accepts legacy tag")
+UpdatesSec:Info("Backward compat")
+UpdatesSec:Label("Legacy Olympus/ profiles show up with [L] prefix")
+UpdatesSec:Label("Re-save them under a clean name when ready")
+
+-- ── v9.4.7 ──
+UpdatesSec:Divider("v9.4.7 — Strip Pass")
+UpdatesSec:Info("Removed")
+UpdatesSec:Label("Visuals section entirely (Personal HP + Opponent HP + View Range)")
+UpdatesSec:Label("Performance section (Low Lag Mode had no purpose without HP)")
+UpdatesSec:Label("Facing Angle slider — locked to source constant 0.1")
+UpdatesSec:Label("~230 lines of dead GUI code stripped")
+UpdatesSec:Info("Game has native HP displays — custom bars were redundant surface")
+
+-- ── v9.4.6 ──
+UpdatesSec:Divider("v9.4.6 — HP Fix + Timing Lock")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Personal HP now renders — parented to protected GUI container")
+UpdatesSec:Label("Opponent HP bars now render — same fix via gethui()")
+UpdatesSec:Label("Both survive game-side PlayerGui sanitization sweeps")
+UpdatesSec:Info("Removed")
+UpdatesSec:Label("Parry Hold slider (locked to source default: 0.27s)")
+UpdatesSec:Label("Parry Window slider (locked to source default: 0.20s)")
+UpdatesSec:Info("Hard-lock prevents accidental AP breakage from misconfigured profiles")
 
 -- ── v9.4.5 ──
 UpdatesSec:Divider("v9.4.5 — Techs + Visuals Pack")
@@ -3082,8 +2894,8 @@ SoonSec:Info("Made By Fgonzxlez")
 -- No custom InputBegan needed for arming — the library handles it.
 -- RightShift still toggles menu visibility if the lib doesn't already.
 local UIS = game:GetService("UserInputService")
-OlympusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
-    if not OlympusState.Alive then return end
+SyndicatusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
+    if not SyndicatusState.Alive then return end
     if gpe then return end
     if inp.UserInputType == Enum.UserInputType.Keyboard then
         if inp.KeyCode == Enum.KeyCode.RightShift then
@@ -3102,7 +2914,7 @@ refreshDrop()
 setMenuInput(false)
 pcall(function() setrobloxinput(true) end)
 
-pcall(function() OlympusState.UI_Window = UI_Window end)
+pcall(function() SyndicatusState.UI_Window = UI_Window end)
 
 -- Re-apply after INS config autosave settles. One deferred catch is enough —
 -- stacking multiple delayed reapplies caused drag frame-stutter.
@@ -3111,5 +2923,5 @@ applyDarkTheme()
 syncMenuPerformance()  -- initial perf state matches initial menu visibility
 task.defer(function() applyMenuBackground() applyDarkTheme() end)
 task.delay(1.0, function() applyMenuBackground() applyDarkTheme() end)
-UI_Library:Notify("Olympus","v9.4.5 | Techs + Visuals pack")
-print("[Olympus v9.4.5] AntiFeint | CritDefense | WC FakeWiff | Shadow Z/B | Personal+Opponent HP | LowLag")
+UI_Library:Notify("Syndicatus","v9.4.8 | Rebranded from Olympus")
+print("[Syndicatus v9.4.8] Rebrand pass | legacy _G key + Olympus/ profile folder still readable")
