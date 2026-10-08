@@ -1,3 +1,11 @@
+
+-- =============================================
+-- Syndicatus Auto Parry — v9.4.40
+-- AP core: open-source registry + continuous window (lolbeans style)
+-- Full version history lives in the Updates tab in-UI.
+-- =============================================
+
+-- Cleanup previous inject — handles both current and legacy _G keys
 pcall(function()
     if _G.__SyndicatusAP and _G.__SyndicatusAP.Cleanup then
         _G.__SyndicatusAP:Cleanup()
@@ -32,6 +40,18 @@ function SyndicatusState:Cleanup()
             self.UI_Window:Destroy()
         end
     end)
+    -- Restore game input before unloading — never leave the user controlless
+    pcall(function()
+        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+        if playerScripts then
+            local playerModule = playerScripts:FindFirstChild("PlayerModule")
+            if playerModule then
+                local module = require(playerModule)
+                module:GetControls():Enable()
+            end
+        end
+    end)
+    pcall(function() setrobloxinput(true) end)
     print("[Syndicatus] Cleaned up previous session")
 end
 
@@ -44,7 +64,7 @@ local StatsSvc    = game:GetService("Stats")
 local LocalPlayer = PlayersSvc.LocalPlayer
 if not LocalPlayer then LocalPlayer = PlayersSvc.PlayerAdded:Wait() end
 
--- Forward-declare AP primitives so BoxingM2 ParryFunction closure (in GameConfig below) captures the local slot
+-- Forward-declare so BoxingM2 ParryFunction closure captures the local slot
 local BlockStart, BlockEnd, Dodge
 
 -- ── Utilities ──
@@ -105,126 +125,52 @@ local function animSetHas(set, id)
     return false
 end
 
--- ── Animation Database (FFTM ids, no remote/image code) ──
+-- ── Animation Database (FFTM ids) ──
 local GameConfig = {
     ["KarateAnims"] = {
-        ["rbxassetid://136346659171696"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://137514920199894"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://72779501873271"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://127487637547915"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://96466099895892"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.3,
-        },
-        ["rbxassetid://116278224437295"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.1,
-        },
+        ["rbxassetid://136346659171696"] = { DisplayName = "1stM1", ReactionTime = 0.15 },
+        ["rbxassetid://137514920199894"] = { DisplayName = "2ndM1", ReactionTime = 0.15 },
+        ["rbxassetid://72779501873271"]  = { DisplayName = "3rdM1", ReactionTime = 0.15 },
+        ["rbxassetid://127487637547915"] = { DisplayName = "4thM1", ReactionTime = 0.15 },
+        ["rbxassetid://96466099895892"]  = { DisplayName = "M2",    ReactionTime = 0.3 },
+        ["rbxassetid://116278224437295"] = { DisplayName = "M2",    ReactionTime = 0.1 },
     },
     ["BasicAnims"] = {
-        ["rbxassetid://100661797632126"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://117315538657801"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://83771012317903"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://129031831390386"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://80331331149375"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.3,
-        },
+        ["rbxassetid://100661797632126"] = { DisplayName = "1stM1" },
+        ["rbxassetid://117315538657801"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://83771012317903"]  = { DisplayName = "3rdM1" },
+        ["rbxassetid://129031831390386"] = { DisplayName = "4thM1" },
+        ["rbxassetid://80331331149375"]  = { DisplayName = "M2", ReactionTime = 0.3 },
         ["M1Time"] = 0.14,
     },
     ["WrestlingAnims"] = {
-        ["rbxassetid://124808151650835"] = {
-            DisplayName = "1stM1",
-        },
-        ["rbxassetid://79996486219181"] = {
-            DisplayName = "2ndM1",
-        },
-        ["rbxassetid://115207134396914"] = {
-            DisplayName = "3rdM1",
-        },
-        ["rbxassetid://74020075116139"] = {
-            DisplayName = "4thM1",
-        },
-        ["rbxassetid://91419261625463"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.3,
-        },
-        ["rbxassetid://135984725924501"] = {
-            DisplayName = "M2EHit"
-        },
-        ["rbxassetid://99774162066012"] = {
-            DisplayName = "M2Success"
-        },
+        ["rbxassetid://124808151650835"] = { DisplayName = "1stM1" },
+        ["rbxassetid://79996486219181"]  = { DisplayName = "2ndM1" },
+        ["rbxassetid://115207134396914"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://74020075116139"]  = { DisplayName = "4thM1" },
+        ["rbxassetid://91419261625463"]  = { DisplayName = "M2", ReactionTime = 0.3 },
+        ["rbxassetid://135984725924501"] = { DisplayName = "M2EHit" },
+        ["rbxassetid://99774162066012"]  = { DisplayName = "M2Success" },
         ["M1Time"] = 0.15,
     },
     ["MuayThaiAnims"] = {
-        ["rbxassetid://110917888708142"] = {
-            DisplayName = "1stM1",
-            ParryTime = 0.08,
-        },
-        ["rbxassetid://136830198456192"] = {
-            DisplayName = "2ndM1",
-            ParryTime = 0.08,
-        },
-        ["rbxassetid://103717575086418"] = {
-            DisplayName = "3rdM1",
-            ParryTime = 0.08,
-        },
-        ["rbxassetid://90445272780399"] = {
-            DisplayName = "4thM1",
-            ParryTime = 0.08,
-        },
-        ["rbxassetid://74462376752922"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.3,
-        },
-        ["rbxassetid://137299369381761"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.1,
-        },
-        ["M1Time"] = 0.1,        
+        ["rbxassetid://110917888708142"] = { DisplayName = "1stM1", ParryTime = 0.08 },
+        ["rbxassetid://136830198456192"] = { DisplayName = "2ndM1", ParryTime = 0.08 },
+        ["rbxassetid://103717575086418"] = { DisplayName = "3rdM1", ParryTime = 0.08 },
+        ["rbxassetid://90445272780399"]  = { DisplayName = "4thM1", ParryTime = 0.08 },
+        ["rbxassetid://74462376752922"]  = { DisplayName = "M2", ReactionTime = 0.3 },
+        ["rbxassetid://137299369381761"] = { DisplayName = "M2", ReactionTime = 0.1 },
+        ["M1Time"] = 0.1,
     },
     ["BoxingAnims"] = {
-        ["rbxassetid://132913269853139"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.17,
-        },
-        ["rbxassetid://76033376851583"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.17,
-        },
-        ["rbxassetid://126463147281440"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.17,
-        },
-        ["rbxassetid://75666664304014"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.17,
-        },
+        ["rbxassetid://132913269853139"] = { DisplayName = "1stM1", ReactionTime = 0.17 },
+        ["rbxassetid://76033376851583"]  = { DisplayName = "2ndM1", ReactionTime = 0.17 },
+        ["rbxassetid://126463147281440"] = { DisplayName = "3rdM1", ReactionTime = 0.17 },
+        ["rbxassetid://75666664304014"]  = { DisplayName = "4thM1", ReactionTime = 0.17 },
         ["rbxassetid://128921678079615"] = {
             DisplayName = "M2",
             ReactionTime = 0.40,
-            BoxingM2 = true,  -- gated by CFG.AutoBoxingM2
+            BoxingM2 = true,
             -- Custom sequence: wait → block → dodge (original behavior)
             ParryFunction = function(data)
                 if not CFG.AutoBoxingM2 then return end
@@ -242,385 +188,187 @@ local GameConfig = {
         },
     },
     ["HakariOtherAnims"] = {
-        ["rbxassetid://117925051452801"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://122040023429227"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://126306184412990"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://85805632651129"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://106589382211868"] = {
-            DisplayName = "MomentumM2"
-        },
-        ["rbxassetid://127394334888645"] = {
-            DisplayName = "M2"
-        },
+        ["rbxassetid://117925051452801"] = { DisplayName = "1stM1" },
+        ["rbxassetid://122040023429227"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://126306184412990"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://85805632651129"]  = { DisplayName = "4thM1" },
+        ["rbxassetid://106589382211868"] = { DisplayName = "MomentumM2" },
+        ["rbxassetid://127394334888645"] = { DisplayName = "M2" },
+        -- Alternate IDs from lolbeans67
+        ["rbxassetid://126612786608030"] = { DisplayName = "1stM1" },
+        ["rbxassetid://113719263885794"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://136305578634960"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://89039586375625"]  = { DisplayName = "4thM1" },
+        ["rbxassetid://101619248052969"] = { DisplayName = "M2", ReactionTime = 0.3 },
     },
     ["CapoeiraAnims"] = {
-        ["rbxassetid://91953931348325"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://127465095270110"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.22,
-        },
-        ["rbxassetid://79017113400162"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.16,
-        },
-        ["rbxassetid://98872276178039"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.16,
-        },
-        ["rbxassetid://101740002500802"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.32,
-        }
+        ["rbxassetid://91953931348325"]  = { DisplayName = "1stM1", ReactionTime = 0.15 },
+        ["rbxassetid://127465095270110"] = { DisplayName = "2ndM1", ReactionTime = 0.22 },
+        ["rbxassetid://79017113400162"]  = { DisplayName = "3rdM1", ReactionTime = 0.16 },
+        ["rbxassetid://98872276178039"]  = { DisplayName = "4thM1", ReactionTime = 0.16 },
+        ["rbxassetid://101740002500802"] = { DisplayName = "M2",    ReactionTime = 0.32 },
     },
     ["SluggerAnims"] = {
-        ["rbxassetid://78852386182257"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.24,
-        },
-        ["rbxassetid://89706363973188"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.22,
-        },
-        ["rbxassetid://127941398150401"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.22
-        },
-        ["rbxassetid://97696355281722"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.19,
-        },
-        ["rbxassetid://86882821333237"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.65,
-        }
+        ["rbxassetid://78852386182257"]  = { DisplayName = "1stM1", ReactionTime = 0.24 },
+        ["rbxassetid://89706363973188"]  = { DisplayName = "2ndM1", ReactionTime = 0.22 },
+        ["rbxassetid://127941398150401"] = { DisplayName = "3rdM1", ReactionTime = 0.22 },
+        ["rbxassetid://97696355281722"]  = { DisplayName = "4thM1", ReactionTime = 0.19 },
+        ["rbxassetid://86882821333237"]  = { DisplayName = "M2",    ReactionTime = 0.65 },
     },
     ["KureAnims"] = {
-        ["rbxassetid://89598700542051"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://84100769626105"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://75725487794798"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://103586798765773"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://128246407698779"] = {
-            DisplayName = "M2"
-        },
-        ["rbxassetid://104060526539640"] = {
-            DisplayName = "M2EHit"
-        }
+        ["rbxassetid://89598700542051"]  = { DisplayName = "1stM1", ReactionTime = 0.16 },
+        ["rbxassetid://84100769626105"]  = { DisplayName = "2ndM1", ReactionTime = 0.16 },
+        ["rbxassetid://75725487794798"]  = { DisplayName = "3rdM1", ReactionTime = 0.16 },
+        ["rbxassetid://103586798765773"] = { DisplayName = "4thM1", ReactionTime = 0.16 },
+        ["rbxassetid://128246407698779"] = { DisplayName = "M2" },
+        ["rbxassetid://104060526539640"] = { DisplayName = "M2EHit" },
     },
     ["AliAnims"] = {
-        ["rbxassetid://103211517133243"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.12,
-        },
-        ["rbxassetid://88548871262625"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.17,
-        },
-        ["rbxassetid://104356393941647"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.21,
-        },
-        ["rbxassetid://109925400698635"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.11,
-        },
-        ["rbxassetid://92831721340116"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.3,
-        },
-        ["rbxassetid://81488798354194"] = {
-            DisplayName = "M2Right",
-            ReactionTime = 0.3,
-        },
+        ["rbxassetid://103211517133243"] = { DisplayName = "1stM1",   ReactionTime = 0.12 },
+        ["rbxassetid://88548871262625"]  = { DisplayName = "2ndM1",   ReactionTime = 0.17 },
+        ["rbxassetid://104356393941647"] = { DisplayName = "3rdM1",   ReactionTime = 0.21 },
+        ["rbxassetid://109925400698635"] = { DisplayName = "4thM1",   ReactionTime = 0.11 },
+        ["rbxassetid://92831721340116"]  = { DisplayName = "M2",      ReactionTime = 0.3 },
+        ["rbxassetid://81488798354194"]  = { DisplayName = "M2Right", ReactionTime = 0.3 },
     },
     ["HakariAnims"] = {
-        ["rbxassetid://123215666398014"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://100249628136368"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.17,
-        },
-        ["rbxassetid://101160496635774"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.15,
-        },
-        ["rbxassetid://76458394174684"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.21,
-        },
-        ["rbxassetid://78127273702521"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.19,
-        },
-        ["rbxassetid://137954350192006"] = {
-            DisplayName = "MomentumM2"
-        },
+        ["rbxassetid://123215666398014"] = { DisplayName = "1stM1", ReactionTime = 0.15 },
+        ["rbxassetid://100249628136368"] = { DisplayName = "2ndM1", ReactionTime = 0.17 },
+        ["rbxassetid://101160496635774"] = { DisplayName = "3rdM1", ReactionTime = 0.15 },
+        ["rbxassetid://76458394174684"]  = { DisplayName = "4thM1", ReactionTime = 0.21 },
+        ["rbxassetid://78127273702521"]  = { DisplayName = "M2",    ReactionTime = 0.19 },
+        ["rbxassetid://137954350192006"] = { DisplayName = "MomentumM2" },
+        ["rbxassetid://82855179231529"]  = { DisplayName = "MomentumM2", ReactionTime = 0.15 },
     },
     ["WingChunAnims"] = {
-        ["rbxassetid://94976161225956"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://130903067566077"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://139503477666199"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.16
-        },
-        ["rbxassetid://135699957281468"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.52
-        },
-        ["rbxassetid://125237241325107"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.06,
-            ForceParry = true,
-        },
-        ["rbxassetid://140240091451745"] = {
-            DisplayName = "M2Success"
-        },
-        ["rbxassetid://138270482936731"] = {
-            DisplayName = "M2EHit"
-        }
+        ["rbxassetid://94976161225956"]  = { DisplayName = "1stM1", ReactionTime = 0.16 },
+        ["rbxassetid://130903067566077"] = { DisplayName = "2ndM1", ReactionTime = 0.16 },
+        ["rbxassetid://139503477666199"] = { DisplayName = "3rdM1", ReactionTime = 0.16 },
+        ["rbxassetid://135699957281468"] = { DisplayName = "4thM1", ReactionTime = 0.52 },
+        ["rbxassetid://125237241325107"] = { DisplayName = "M2",    ReactionTime = 0.06, ForceParry = true },
+        ["rbxassetid://140240091451745"] = { DisplayName = "M2Success" },
+        ["rbxassetid://138270482936731"] = { DisplayName = "M2EHit" },
     },
     ["StrikerAnims"] = {
         -- Set A (older)
-        ["rbxassetid://79224782278508"] = { DisplayName = "1stM1 (A)" },
-        ["rbxassetid://74337052553355"] = { DisplayName = "2ndM1 (A)" },
+        ["rbxassetid://79224782278508"]  = { DisplayName = "1stM1 (A)" },
+        ["rbxassetid://74337052553355"]  = { DisplayName = "2ndM1 (A)" },
         ["rbxassetid://121264916189386"] = { DisplayName = "3rdM1 (A)" },
         ["rbxassetid://125556631043249"] = { DisplayName = "4thM1 (A)" },
-        -- Legacy M2 / feint (screenshot "StrikerFeint" ~0.31)
+        -- Legacy M2 / feint
         ["rbxassetid://128600830397859"] = { DisplayName = "StrikerFeint", ReactionTime = 0.31 },
         -- Set B (alternate)
         ["rbxassetid://132840225082238"] = { DisplayName = "1stM1 (B)" },
-        ["rbxassetid://88761422474765"] = { DisplayName = "2ndM1 (B)" },
-        ["rbxassetid://98462236639320"] = { DisplayName = "3rdM1 (B)" },
+        ["rbxassetid://88761422474765"]  = { DisplayName = "2ndM1 (B)" },
+        ["rbxassetid://98462236639320"]  = { DisplayName = "3rdM1 (B)" },
         ["rbxassetid://122451562066756"] = { DisplayName = "4thM1 (B)" },
         -- Current set (faster chain)
         ["rbxassetid://116642061934550"] = { DisplayName = "1stM1", ReactionTime = 0.20 },
         ["rbxassetid://115234849770695"] = { DisplayName = "2ndM1", ReactionTime = 0.18 },
-        ["rbxassetid://85554794950365"] = { DisplayName = "3rdM1", ReactionTime = 0.05 },
-        ["rbxassetid://73777821288331"] = { DisplayName = "4thM1", ReactionTime = 0.05 },
-        ["rbxassetid://99309341097380"] = { DisplayName = "M2", ReactionTime = 0.30 },
+        ["rbxassetid://85554794950365"]  = { DisplayName = "3rdM1", ReactionTime = 0.05 },
+        ["rbxassetid://73777821288331"]  = { DisplayName = "4thM1", ReactionTime = 0.05 },
+        ["rbxassetid://99309341097380"]  = { DisplayName = "M2",    ReactionTime = 0.30 },
     },
     ["KickboxingAnims"] = {
-        ["rbxassetid://127679697578124"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://111648334200984"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://109134308246065"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://123237866254734"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://119415047601579"] = {
-            DisplayName = "M2"
-        },
-        ["rbxassetid://140240091451745"] = {
-            DisplayName = "M2Success"
-        },
-        ["rbxassetid://138270482936731"] = {
-            DisplayName = "M2EHit"
-        }
+        ["rbxassetid://127679697578124"] = { DisplayName = "1stM1" },
+        ["rbxassetid://111648334200984"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://109134308246065"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://123237866254734"] = { DisplayName = "4thM1" },
+        ["rbxassetid://119415047601579"] = { DisplayName = "M2" },
+        ["rbxassetid://140240091451745"] = { DisplayName = "M2Success" },
+        ["rbxassetid://138270482936731"] = { DisplayName = "M2EHit" },
     },
     ["KyokushinAnims"] = {
-        ["rbxassetid://108157433609067"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://139691512657916"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://94267870513016"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://107365196082362"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://128363063231486"] = {
-            DisplayName = "M2"
-        },
-        ["rbxassetid://80822959210741"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.300,
-        },
+        ["rbxassetid://108157433609067"] = { DisplayName = "1stM1" },
+        ["rbxassetid://139691512657916"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://94267870513016"]  = { DisplayName = "3rdM1" },
+        ["rbxassetid://107365196082362"] = { DisplayName = "4thM1" },
+        ["rbxassetid://128363063231486"] = { DisplayName = "M2" },
+        ["rbxassetid://80822959210741"]  = { DisplayName = "M2", ReactionTime = 0.300 },
     },
     ["CQCAnims"] = {
-        ["rbxassetid://80051878176163"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://112809686330315"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://96690751054332"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://75394567475187"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://136636440521127"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.1,
-        },
+        ["rbxassetid://80051878176163"]  = { DisplayName = "1stM1" },
+        ["rbxassetid://112809686330315"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://96690751054332"]  = { DisplayName = "3rdM1" },
+        ["rbxassetid://75394567475187"]  = { DisplayName = "4thM1" },
+        ["rbxassetid://136636440521127"] = { DisplayName = "M2", ReactionTime = 0.1 },
+        -- Alternate IDs from lolbeans67
+        ["rbxassetid://115957047639796"] = { DisplayName = "1stM1", ReactionTime = 0.20 },
+        ["rbxassetid://139153666059747"] = { DisplayName = "2ndM1", ReactionTime = 0.20 },
+        ["rbxassetid://96433631480947"]  = { DisplayName = "3rdM1", ReactionTime = 0.10 },
+        ["rbxassetid://119132409702905"] = { DisplayName = "4thM1", ReactionTime = 0.24 },
+        ["rbxassetid://103319500580356"] = { DisplayName = "M2", ReactionTime = 0.30 },
+        ["rbxassetid://135110210666200"] = { DisplayName = "M2", ReactionTime = 0.30 },
+        ["rbxassetid://72310116631906"]  = { DisplayName = "M2", ReactionTime = 0.30 },
     },
     ["MishimaAnims"] = {
-        ["rbxassetid://122564675454774"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://124288660244802"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://116344736444569"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://109354190051977"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://113531813891302"] = {
-            DisplayName = "M2"
-        }
+        ["rbxassetid://122564675454774"] = { DisplayName = "1stM1" },
+        ["rbxassetid://124288660244802"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://116344736444569"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://109354190051977"] = { DisplayName = "4thM1" },
+        ["rbxassetid://113531813891302"] = { DisplayName = "M2" },
     },
     ["LethweiAnims"] = {
-        ["rbxassetid://126845586831338"] = {
-            DisplayName = "1stM1"
-        },
-        ["rbxassetid://111506889308405"] = {
-            DisplayName = "2ndM1"
-        },
-        ["rbxassetid://93862547414782"] = {
-            DisplayName = "3rdM1"
-        },
-        ["rbxassetid://81747456615347"] = {
-            DisplayName = "4thM1"
-        },
-        ["rbxassetid://98256190530845"] = {
-            DisplayName = "M2"
-        }
+        ["rbxassetid://126845586831338"] = { DisplayName = "1stM1" },
+        ["rbxassetid://111506889308405"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://93862547414782"]  = { DisplayName = "3rdM1" },
+        ["rbxassetid://81747456615347"]  = { DisplayName = "4thM1" },
+        ["rbxassetid://98256190530845"]  = { DisplayName = "M2" },
     },
     ["JinAnims"] = {
-        ["rbxassetid://89404705737555"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://126407816250012"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://111599179234006"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://115508221180588"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://90986005545750"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.1,
-        },
+        ["rbxassetid://89404705737555"]  = { DisplayName = "1stM1", ReactionTime = 0.1 },
+        ["rbxassetid://126407816250012"] = { DisplayName = "2ndM1", ReactionTime = 0.1 },
+        ["rbxassetid://111599179234006"] = { DisplayName = "3rdM1", ReactionTime = 0.1 },
+        ["rbxassetid://115508221180588"] = { DisplayName = "4thM1", ReactionTime = 0.1 },
+        ["rbxassetid://90986005545750"]  = { DisplayName = "M2",    ReactionTime = 0.1 },
     },
     ["DragonAnims"] = {
-        ["rbxassetid://90632031214738"] = {
-            DisplayName = "1stM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://129870265426519"] = {
-            DisplayName = "2ndM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://103119271372106"] = {
-            DisplayName = "3rdM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://81350056849630"] = {
-            DisplayName = "4thM1",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://101059515516534"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.1,
-        },
-        ["rbxassetid://101850612921423"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.1,
-        },
+        ["rbxassetid://90632031214738"]  = { DisplayName = "1stM1", ReactionTime = 0.1 },
+        ["rbxassetid://129870265426519"] = { DisplayName = "2ndM1", ReactionTime = 0.1 },
+        ["rbxassetid://103119271372106"] = { DisplayName = "3rdM1", ReactionTime = 0.1 },
+        ["rbxassetid://81350056849630"]  = { DisplayName = "4thM1", ReactionTime = 0.1 },
+        ["rbxassetid://101059515516534"] = { DisplayName = "M2",    ReactionTime = 0.1 },
+        ["rbxassetid://101850612921423"] = { DisplayName = "M2",    ReactionTime = 0.1 },
     },
-
     ["PerfectCopyAnims"] = {
-        ["rbxassetid://89266206062347"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
+        ["rbxassetid://89266206062347"]  = { DisplayName = "1stM1", ReactionTime = 0.150 },
         ["rbxassetid://118618177788645"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://92563642848078"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
+        ["rbxassetid://92563642848078"]  = { DisplayName = "3rdM1", ReactionTime = 0.150 },
         ["rbxassetid://129685126037621"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://84779382426562"] = { DisplayName = "M2", ReactionTime = 0.300 },
-        ["rbxassetid://123851034848865"] = { DisplayName = "M2", ReactionTime = 0.300 },
+        ["rbxassetid://84779382426562"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
+        ["rbxassetid://123851034848865"] = { DisplayName = "M2",    ReactionTime = 0.300 },
     },
     ["AikidoAnims"] = {
         ["rbxassetid://101667835774312"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://72100016327641"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://86622096544948"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
+        ["rbxassetid://72100016327641"]  = { DisplayName = "2ndM1", ReactionTime = 0.150 },
+        ["rbxassetid://86622096544948"]  = { DisplayName = "3rdM1", ReactionTime = 0.150 },
         ["rbxassetid://116579071175823"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://113723231962801"] = {
-            DisplayName = "M2",
-            ReactionTime = 0.200,
-            -- Counter (like Wing Chun M2): always parry, never auto-dodge
-            ForceParry = true,
-        },
+        -- Counter (like Wing Chun M2): always parry, never auto-dodge
+        ["rbxassetid://113723231962801"] = { DisplayName = "M2", ReactionTime = 0.200, ForceParry = true },
     },
     ["TaijutsuAnims"] = {
         ["rbxassetid://112772003891760"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
         ["rbxassetid://120968355159054"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
         ["rbxassetid://134363734889174"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
         ["rbxassetid://140439623648569"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://70666956463595"] = { DisplayName = "M2", ReactionTime = 0.300 },
+        ["rbxassetid://70666956463595"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
     },
     ["GiovannaAnims"] = {
         ["rbxassetid://135716459366783"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
         ["rbxassetid://128178940723536"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
         ["rbxassetid://133339208745195"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
         ["rbxassetid://129619149164145"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://84500842912133"] = { DisplayName = "M2", ReactionTime = 0.300 },
+        ["rbxassetid://84500842912133"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
     },
     ["HikakenAnims"] = {
         ["rbxassetid://109471728828625"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://92152402802393"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
+        ["rbxassetid://92152402802393"]  = { DisplayName = "2ndM1", ReactionTime = 0.150 },
         ["rbxassetid://139736320509560"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
-        ["rbxassetid://80033824766939"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://94916233438251"] = { DisplayName = "M2", ReactionTime = 0.300 },
+        ["rbxassetid://80033824766939"]  = { DisplayName = "4thM1", ReactionTime = 0.150 },
+        ["rbxassetid://94916233438251"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
     },
-
     ["Debug"] = {
-        ["http://www.roblox.com/asset/?id=125750702"] = {
-            DisplayName = "M1",
-            ReactionTime = 0.3,
-        },
+        ["http://www.roblox.com/asset/?id=125750702"] = { DisplayName = "M1", ReactionTime = 0.3 },
     },
 }
 
@@ -643,144 +391,100 @@ for style, anims in pairs(GameConfig) do
 end
 GameConfig = FlatConfig
 
--- Apply Parry Godzz timings as built-in defaults when IDs match
+-- Awakened / alternate M2 IDs (ported from lolbeans67) — same timings as base, labeled for UI
+do
+    local function cloneAnim(fromId, toId, flags)
+        local src = GameConfig[fromId]
+        if not src then return end
+        local copy = {}
+        for k, v in pairs(src) do copy[k] = v end
+        if flags then for k, v in pairs(flags) do copy[k] = v end end
+        GameConfig[toId] = copy
+    end
+    cloneAnim("rbxassetid://128921678079615", "rbxassetid://132891856788045", { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://91419261625463",  "rbxassetid://83352556099235",  { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://90986005545750",  "rbxassetid://85984892267786",  { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://78127273702521",  "rbxassetid://82076026376495",  { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://78127273702521",  "rbxassetid://137954350192006",  { Blackflash = true, DisplayName = "Blackflash M2" })
+    cloneAnim("rbxassetid://137299369381761", "rbxassetid://124394929276448",  { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://98256190530845",  "rbxassetid://120251079111989",  { DisplayName = "M2" })
+    cloneAnim("rbxassetid://120251079111989", "rbxassetid://100495393065612",  { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://70666956463595",  "rbxassetid://139458993289546",  { Awakened = true, DisplayName = "M2 (Awakened)" })
+    cloneAnim("rbxassetid://128363063231486", "rbxassetid://80822959210741",   { DisplayName = "M2" })
+end
+
+
+-- Godzz timing overrides — standardised reaction times across known ids
 do
     local Godzz = {
-        ["rbxassetid://100249628136368"] = 0.180,
-        ["rbxassetid://100661797632126"] = 0.150,
-        ["rbxassetid://101059515516534"] = 0.450,
-        ["rbxassetid://101160496635774"] = 0.150,
-        ["rbxassetid://101740002500802"] = 0.330,
-        ["rbxassetid://101850612921423"] = 0.450,
-        ["rbxassetid://103119271372106"] = 0.170,
-        ["rbxassetid://103211517133243"] = 0.130,
-        ["rbxassetid://103586798765773"] = 0.150,
-        ["rbxassetid://103717575086418"] = 0.160,
-        ["rbxassetid://104356393941647"] = 0.220,
-        ["rbxassetid://107365196082362"] = 0.335,
-        ["rbxassetid://108157433609067"] = 0.125,
-        ["rbxassetid://109134308246065"] = 0.230,
-        ["rbxassetid://109354190051977"] = 0.110,
-        ["rbxassetid://109925400698635"] = 0.120,
-        ["rbxassetid://110917888708142"] = 0.160,
-        ["rbxassetid://111506889308405"] = 0.260,
-        ["rbxassetid://111599179234006"] = 0.195,
-        ["rbxassetid://111648334200984"] = 0.180,
-        ["rbxassetid://112809686330315"] = 0.225,
-        ["rbxassetid://113531813891302"] = 0.150,
-        ["rbxassetid://115207134396914"] = 0.160,
-        ["rbxassetid://115508221180588"] = 0.400,
-        ["rbxassetid://116278224437295"] = 0.310,
-        ["rbxassetid://116344736444569"] = 0.120,
-        ["rbxassetid://117315538657801"] = 0.150,
-        ["rbxassetid://119415047601579"] = 0.180,
-        ["rbxassetid://121264916189386"] = 0.060,
-        ["rbxassetid://122564675454774"] = 0.110,
-        ["rbxassetid://123215666398014"] = 0.150,
-        ["rbxassetid://123237866254734"] = 0.290,
-        ["rbxassetid://124288660244802"] = 0.110,
-        ["rbxassetid://124808151650835"] = 0.160,
-        ["rbxassetid://125237241325107"] = 0.070,
-        ["rbxassetid://125556631043249"] = 0.060,
-        ["rbxassetid://126407816250012"] = 0.420,
-        ["rbxassetid://126463147281440"] = 0.170,
-        ["rbxassetid://126845586831338"] = 0.290,
-        ["rbxassetid://127465095270110"] = 0.280,
-        ["rbxassetid://127487637547915"] = 0.290,
-        ["rbxassetid://127679697578124"] = 0.170,
-        ["rbxassetid://127941398150401"] = 0.260,
-        ["rbxassetid://128246407698779"] = 0.105,
-        ["rbxassetid://128363063231486"] = 0.620,
-        ["rbxassetid://128600830397859"] = 0.310, -- StrikerFeint
-        ["rbxassetid://128921678079615"] = 0.100,
-        ["rbxassetid://129031831390386"] = 0.158,
-        ["rbxassetid://129870265426519"] = 0.220,
-        ["rbxassetid://130903067566077"] = 0.120,
-        ["rbxassetid://132913269853139"] = 0.190,
-        ["rbxassetid://135699957281468"] = 0.470,
-        ["rbxassetid://136346659171696"] = 0.160,
-        ["rbxassetid://136830198456192"] = 0.180,
-        ["rbxassetid://137299369381761"] = 0.380,
-        ["rbxassetid://137514920199894"] = 0.160,
-        ["rbxassetid://139503477666199"] = 0.120,
-        ["rbxassetid://139691512657916"] = 0.140,
-        ["rbxassetid://72779501873271"] = 0.210,
-        ["rbxassetid://74020075116139"] = 0.200,
-        ["rbxassetid://74337052553355"] = 0.190,
-        ["rbxassetid://75394567475187"] = 0.310,
-        ["rbxassetid://75666664304014"] = 0.200,
-        ["rbxassetid://75725487794798"] = 0.160,
-        ["rbxassetid://76033376851583"] = 0.180,
-        ["rbxassetid://76458394174684"] = 0.220,
-        ["rbxassetid://78127273702521"] = 0.200,
-        ["rbxassetid://78852386182257"] = 0.290,
-        ["rbxassetid://79017113400162"] = 0.170,
-        ["rbxassetid://79224782278508"] = 0.210,
-        ["rbxassetid://79996486219181"] = 0.160,
-        ["rbxassetid://80051878176163"] = 0.225,
-        ["rbxassetid://80331331149375"] = 0.310,
-        ["rbxassetid://81350056849630"] = 0.170,
-        ["rbxassetid://81488798354194"] = 0.410,
-        ["rbxassetid://81747456615347"] = 0.220,
-        ["rbxassetid://83771012317903"] = 0.150,
-        ["rbxassetid://84100769626105"] = 0.170,
-        ["rbxassetid://86882821333237"] = 0.600,
-        ["rbxassetid://88548871262625"] = 0.180,
-        ["rbxassetid://89404705737555"] = 0.230,
-        ["rbxassetid://89598700542051"] = 0.180,
-        ["rbxassetid://89706363973188"] = 0.270,
-        ["rbxassetid://90445272780399"] = 0.150,
-        ["rbxassetid://90632031214738"] = 0.170,
-        ["rbxassetid://90986005545750"] = 0.180,
-        ["rbxassetid://91419261625463"] = 0.160,
-        ["rbxassetid://91953931348325"] = 0.160,
-        ["rbxassetid://92831721340116"] = 0.340,
-        ["rbxassetid://93862547414782"] = 0.250,
-        ["rbxassetid://94267870513016"] = 0.170,
-        ["rbxassetid://94976161225956"] = 0.120,
-        ["rbxassetid://96690751054332"] = 0.190,
-        ["rbxassetid://97696355281722"] = 0.200,
-        ["rbxassetid://98256190530845"] = 0.260,
-        ["rbxassetid://98872276178039"] = 0.220,
+        ["rbxassetid://100249628136368"] = 0.180, ["rbxassetid://100661797632126"] = 0.150,
+        ["rbxassetid://101059515516534"] = 0.450, ["rbxassetid://101160496635774"] = 0.150,
+        ["rbxassetid://101740002500802"] = 0.330, ["rbxassetid://101850612921423"] = 0.450,
+        ["rbxassetid://103119271372106"] = 0.170, ["rbxassetid://103211517133243"] = 0.130,
+        ["rbxassetid://103586798765773"] = 0.150, ["rbxassetid://103717575086418"] = 0.160,
+        ["rbxassetid://104356393941647"] = 0.220, ["rbxassetid://107365196082362"] = 0.335,
+        ["rbxassetid://108157433609067"] = 0.125, ["rbxassetid://109134308246065"] = 0.230,
+        ["rbxassetid://109354190051977"] = 0.110, ["rbxassetid://109925400698635"] = 0.120,
+        ["rbxassetid://110917888708142"] = 0.160, ["rbxassetid://111506889308405"] = 0.260,
+        ["rbxassetid://111599179234006"] = 0.195, ["rbxassetid://111648334200984"] = 0.180,
+        ["rbxassetid://112809686330315"] = 0.225, ["rbxassetid://113531813891302"] = 0.150,
+        ["rbxassetid://115207134396914"] = 0.160, ["rbxassetid://115508221180588"] = 0.400,
+        ["rbxassetid://116278224437295"] = 0.310, ["rbxassetid://116344736444569"] = 0.120,
+        ["rbxassetid://117315538657801"] = 0.150, ["rbxassetid://119415047601579"] = 0.180,
+        ["rbxassetid://121264916189386"] = 0.060, ["rbxassetid://122564675454774"] = 0.110,
+        ["rbxassetid://123215666398014"] = 0.150, ["rbxassetid://123237866254734"] = 0.290,
+        ["rbxassetid://124288660244802"] = 0.110, ["rbxassetid://124808151650835"] = 0.160,
+        ["rbxassetid://125237241325107"] = 0.070, ["rbxassetid://125556631043249"] = 0.060,
+        ["rbxassetid://126407816250012"] = 0.420, ["rbxassetid://126463147281440"] = 0.170,
+        ["rbxassetid://126845586831338"] = 0.290, ["rbxassetid://127465095270110"] = 0.280,
+        ["rbxassetid://127487637547915"] = 0.290, ["rbxassetid://127679697578124"] = 0.170,
+        ["rbxassetid://127941398150401"] = 0.260, ["rbxassetid://128246407698779"] = 0.105,
+        ["rbxassetid://128363063231486"] = 0.620, ["rbxassetid://128600830397859"] = 0.310,
+        ["rbxassetid://128921678079615"] = 0.100, ["rbxassetid://129031831390386"] = 0.158,
+        ["rbxassetid://129870265426519"] = 0.220, ["rbxassetid://130903067566077"] = 0.120,
+        ["rbxassetid://132913269853139"] = 0.190, ["rbxassetid://135699957281468"] = 0.470,
+        ["rbxassetid://136346659171696"] = 0.160, ["rbxassetid://136830198456192"] = 0.180,
+        ["rbxassetid://137299369381761"] = 0.380, ["rbxassetid://137514920199894"] = 0.160,
+        ["rbxassetid://139503477666199"] = 0.120, ["rbxassetid://139691512657916"] = 0.140,
+        ["rbxassetid://72779501873271"]  = 0.210, ["rbxassetid://74020075116139"]  = 0.200,
+        ["rbxassetid://74337052553355"]  = 0.190, ["rbxassetid://75394567475187"]  = 0.310,
+        ["rbxassetid://75666664304014"]  = 0.200, ["rbxassetid://75725487794798"]  = 0.160,
+        ["rbxassetid://76033376851583"]  = 0.180, ["rbxassetid://76458394174684"]  = 0.220,
+        ["rbxassetid://78127273702521"]  = 0.200, ["rbxassetid://78852386182257"]  = 0.290,
+        ["rbxassetid://79017113400162"]  = 0.170, ["rbxassetid://79224782278508"]  = 0.210,
+        ["rbxassetid://79996486219181"]  = 0.160, ["rbxassetid://80051878176163"]  = 0.225,
+        ["rbxassetid://80331331149375"]  = 0.310, ["rbxassetid://81350056849630"]  = 0.170,
+        ["rbxassetid://81488798354194"]  = 0.410, ["rbxassetid://81747456615347"]  = 0.220,
+        ["rbxassetid://83771012317903"]  = 0.150, ["rbxassetid://84100769626105"]  = 0.170,
+        ["rbxassetid://86882821333237"]  = 0.600, ["rbxassetid://88548871262625"]  = 0.180,
+        ["rbxassetid://89404705737555"]  = 0.230, ["rbxassetid://89598700542051"]  = 0.180,
+        ["rbxassetid://89706363973188"]  = 0.270, ["rbxassetid://90445272780399"]  = 0.150,
+        ["rbxassetid://90632031214738"]  = 0.170, ["rbxassetid://90986005545750"]  = 0.180,
+        ["rbxassetid://91419261625463"]  = 0.160, ["rbxassetid://91953931348325"]  = 0.160,
+        ["rbxassetid://92831721340116"]  = 0.340, ["rbxassetid://93862547414782"]  = 0.250,
+        ["rbxassetid://94267870513016"]  = 0.170, ["rbxassetid://94976161225956"]  = 0.120,
+        ["rbxassetid://96690751054332"]  = 0.190, ["rbxassetid://97696355281722"]  = 0.200,
+        ["rbxassetid://98256190530845"]  = 0.260, ["rbxassetid://98872276178039"]  = 0.220,
         ["http://www.roblox.com/asset/?id=125750702"] = 0.310,
-        -- New styles (starting defaults; tune in Timings tab)
-        ["rbxassetid://89266206062347"] = 0.150,
-        ["rbxassetid://118618177788645"] = 0.150,
-        ["rbxassetid://92563642848078"] = 0.150,
-        ["rbxassetid://129685126037621"] = 0.150,
-        ["rbxassetid://84779382426562"] = 0.300,
-        ["rbxassetid://123851034848865"] = 0.300,
-        ["rbxassetid://101667835774312"] = 0.150,
-        ["rbxassetid://72100016327641"] = 0.150,
-        ["rbxassetid://86622096544948"] = 0.150,
-        ["rbxassetid://116579071175823"] = 0.150,
-        ["rbxassetid://113723231962801"] = 0.200,
-        ["rbxassetid://112772003891760"] = 0.150,
-        ["rbxassetid://120968355159054"] = 0.150,
-        ["rbxassetid://134363734889174"] = 0.150,
-        ["rbxassetid://140439623648569"] = 0.150,
-        ["rbxassetid://70666956463595"] = 0.300,
-        ["rbxassetid://135716459366783"] = 0.150,
-        ["rbxassetid://128178940723536"] = 0.150,
-        ["rbxassetid://133339208745195"] = 0.150,
-        ["rbxassetid://129619149164145"] = 0.150,
-        ["rbxassetid://84500842912133"] = 0.300,
-        ["rbxassetid://109471728828625"] = 0.150,
-        ["rbxassetid://92152402802393"] = 0.150,
-        ["rbxassetid://139736320509560"] = 0.150,
-        ["rbxassetid://80033824766939"] = 0.150,
-        ["rbxassetid://94916233438251"] = 0.300,
-        ["rbxassetid://80822959210741"] = 0.300,
-        ["rbxassetid://132840225082238"] = 0.210,
-        ["rbxassetid://88761422474765"] = 0.190,
-        ["rbxassetid://98462236639320"] = 0.060,
-        ["rbxassetid://122451562066756"] = 0.060,
-        ["rbxassetid://116642061934550"] = 0.200,
-        ["rbxassetid://115234849770695"] = 0.180,
-        ["rbxassetid://85554794950365"] = 0.050,
-        ["rbxassetid://73777821288331"] = 0.050,
-        ["rbxassetid://99309341097380"] = 0.300,
-
+        -- Newer styles (starting defaults; tune in Timings tab)
+        ["rbxassetid://89266206062347"]  = 0.150, ["rbxassetid://118618177788645"] = 0.150,
+        ["rbxassetid://92563642848078"]  = 0.150, ["rbxassetid://129685126037621"] = 0.150,
+        ["rbxassetid://84779382426562"]  = 0.300, ["rbxassetid://123851034848865"] = 0.300,
+        ["rbxassetid://101667835774312"] = 0.150, ["rbxassetid://72100016327641"]  = 0.150,
+        ["rbxassetid://86622096544948"]  = 0.150, ["rbxassetid://116579071175823"] = 0.150,
+        ["rbxassetid://113723231962801"] = 0.200, ["rbxassetid://112772003891760"] = 0.150,
+        ["rbxassetid://120968355159054"] = 0.150, ["rbxassetid://134363734889174"] = 0.150,
+        ["rbxassetid://140439623648569"] = 0.150, ["rbxassetid://70666956463595"]  = 0.300,
+        ["rbxassetid://135716459366783"] = 0.150, ["rbxassetid://128178940723536"] = 0.150,
+        ["rbxassetid://133339208745195"] = 0.150, ["rbxassetid://129619149164145"] = 0.150,
+        ["rbxassetid://84500842912133"]  = 0.300, ["rbxassetid://109471728828625"] = 0.150,
+        ["rbxassetid://92152402802393"]  = 0.150, ["rbxassetid://139736320509560"] = 0.150,
+        ["rbxassetid://80033824766939"]  = 0.150, ["rbxassetid://94916233438251"]  = 0.300,
+        ["rbxassetid://80822959210741"]  = 0.300, ["rbxassetid://132840225082238"] = 0.210,
+        ["rbxassetid://88761422474765"]  = 0.190, ["rbxassetid://98462236639320"]  = 0.060,
+        ["rbxassetid://122451562066756"] = 0.060, ["rbxassetid://116642061934550"] = 0.200,
+        ["rbxassetid://115234849770695"] = 0.180, ["rbxassetid://85554794950365"]  = 0.050,
+        ["rbxassetid://73777821288331"]  = 0.050, ["rbxassetid://99309341097380"]  = 0.300,
     }
     local n = 0
     for id, rt in pairs(Godzz) do
@@ -801,8 +505,6 @@ end
 
 -- ── Multi-Config ────────────────────────────
 local PROFILE_FOLDER = "Syndicatus"
-local LEGACY_PROFILE_FOLDER = "Syndicates"  -- v9.4.8: fallback for pre-rebrand saves
-local GAKURAN_FOLDER = "GakuranConfigs"
 local profileSourceMap = {}
 
 local function ensureFolder()
@@ -824,36 +526,6 @@ local function listProfiles()
         if n then
             table.insert(names, n)
             profileSourceMap[n] = { format = "json", path = s }
-        end
-    end
-    -- v9.4.8: also enumerate the pre-rebrand Olympus/ folder; marked with [L] prefix so
-    -- users can see what's legacy and re-save under a clean name if they want
-    if isfolder and isfolder(LEGACY_PROFILE_FOLDER) then
-        local lfiles = {}
-        pcall(function() lfiles = listfiles(LEGACY_PROFILE_FOLDER) or {} end)
-        for _, f in pairs(lfiles) do
-            local s = tostring(f)
-            local n = s:match("([^/\\]+)%.json$")
-            if n then
-                local d = "[L] " .. n
-                if not profileSourceMap[n] and not profileSourceMap[d] then
-                    table.insert(names, d)
-                    profileSourceMap[d] = { format = "json", path = s }
-                end
-            end
-        end
-    end
-    if isfolder and isfolder(GAKURAN_FOLDER) then
-        local gfiles = {}
-        pcall(function() gfiles = listfiles(GAKURAN_FOLDER) or {} end)
-        for _, f in pairs(gfiles) do
-            local s = tostring(f)
-            local n = s:match("([^/\\]+)%.lua$")
-            if n then
-                local d = "[G] " .. n
-                table.insert(names, d)
-                profileSourceMap[d] = { format = "lua", path = s }
-            end
         end
     end
     table.sort(names)
@@ -879,23 +551,14 @@ local function loadProfile(name)
     if not src then listProfiles() src = profileSourceMap[name] end
     if not src then return nil end
     local ok, data = pcall(function()
-        local raw = readfile(src.path)
-        if src.format == "json" then
-            return HttpService:JSONDecode(raw)
-        else
-            local chunk = loadstring(raw)
-            if not chunk then return nil end
-            local d = chunk()
-            if d and d.Timings then return { Timings = d.Timings } end
-            return nil
-        end
+        return HttpService:JSONDecode(readfile(src.path))
     end)
     return ok and data or nil
 end
 
 local function deleteProfile(name)
     local src = profileSourceMap[name]
-    if not src or src.format ~= "json" then return false end
+    if not src then return false end
     pcall(function() if delfile then delfile(src.path) end end)
     pcall(function() if delfile then delfile(PROFILE_FOLDER .. "/" .. name .. ".json") end end)
     return true
@@ -904,16 +567,16 @@ end
 -- ── State ───────────────────────────────────
 local CFG = {
     Enabled=true,AutoDodge=true,AutoBoxingM2=true,MultiTarget=true,AutoTargetNearest=true,
-    CycleRange=20,APRange=10,ParryOffset=0,ParryHold=0.27,ParryWindow=0.20,AutoHeight=true,HeightInfluence=1,
+    CycleRange=20,APRange=11,ParryOffset=0,ParryHold=0.27,ParryWindow=0.20,AutoHeight=true,HeightInfluence=1,
     PingCompensate=true,ProbabilityToParry=100,
     Debug=false,APKeybind="g",
     SoundOnParry=false,
-    RhythmAutoHit=false,  -- rhythm note auto-hit (was Auto Play)
+    RhythmAutoHit=false,
     AntiAFK=false, AFKInterval=240,
     AutoRespawn=false, RespawnDelay=1.5,
     TargetFacingYou=false, YouFacingTarget=true,
-    FacingThreshold=0.1,  -- matches open-source (0.1); 0.5 ≈ 60° cone
-    -- v9.4.5 feature pack (v9.4.7: HP/LowLag stripped — game has native HP)
+    FacingThreshold=0.1,  -- source constant, hard-locked (no UI exposure)
+    -- Tech pack
     AntiFeint=false,
     CritDefense=false,
     WCFakeWiff=false, WCFakeWiffTime=0.18,
@@ -938,15 +601,13 @@ local function GetPingValue()
     return 50
 end
 
--- 10Hz cache — refreshed on Heartbeat tick below. Worst-case fire-point drift
--- from 100ms ping staleness is ~5ms, well inside default 200ms ParryWindow.
+-- 10Hz cache — refreshed on Heartbeat tick below
 local CachedPing = GetPingValue()
 local lastPingUpdate = 0
 local function GetCachedPing()
     return CachedPing
 end
 
--- ── v9.4.3 consistency package (silent, always-on) ──
 -- Ping jitter ring buffer: 20 samples @ 10Hz = 2s rolling window
 local PING_SAMPLE_COUNT = 20
 local pingSamples = table.create(PING_SAMPLE_COUNT, CachedPing)
@@ -954,10 +615,10 @@ local pingSampleIdx = 1
 local pingJitter = 0  -- ms, max-min over window
 
 -- Movement bias (horizontal velocity-driven early-fire)
--- > 20 studs/s (sprint-ish): -15ms. > 8 studs/s (walk): -8ms. Else 0.
+-- > 20 studs/s (sprint): -15ms. > 8 studs/s (walk): -8ms. Else 0.
 local cachedMovementBias = 0
 
--- Height cache (weak-keyed per character — GC drops dead chars automatically).
+-- Height cache (weak-keyed per character — GC drops dead chars automatically)
 -- BodyHeightScale is set at spawn and does not change mid-fight in FFTM-style games.
 local heightCache = setmetatable({}, {__mode = "k"})
 local function heightScale(character)
@@ -972,7 +633,6 @@ local function heightScale(character)
     return v
 end
 
--- Centralised heavy check — identical to the two previous inline copies
 local function IsHeavy(cfg)
     return cfg.Heavy
         or cfg.DisplayName == "M2"
@@ -1007,14 +667,21 @@ end
 
 -- Source: ReleaseDeadline = StartTime + HoldFor  (NOT os.clock() + hold)
 function BlockStart(StartTime, HoldFor)
-    if not StartTime then
-        return
-    end
+    if not StartTime then return end
     if not CFG.Enabled then return end
     if LocalStunned then return end
 
     if CurrentParryState ~= ParryState.IDLE then
         TransitionToState(ParryState.IDLE)
+    end
+
+    -- Edge-trigger fix: if F is already held from a previous fire, release it first.
+    -- Many parry systems are edge-triggered — a held key doesn't retrigger a parry
+    -- input. Mid-combo chains (where the next M1 lands before ReleaseDeadline) were
+    -- getting dropped silently. Release + press forces distinct InputBegan events
+    -- so each attack gets its own parry attempt registered.
+    if KeyHeld then
+        pcall(function() keyrelease(ParryKey) end)
     end
 
     local hold = HoldFor or CFG.ParryHold or 0.27
@@ -1032,9 +699,7 @@ function BlockEnd()
 end
 
 function Dodge(force)
-    if not force and not CFG.AutoDodge then
-        return
-    end
+    if not force and not CFG.AutoDodge then return end
     BlockEnd()
     pcall(function()
         for _ = 1, 12 do
@@ -1044,9 +709,8 @@ function Dodge(force)
     end)
 end
 
--- ── v9.4.5 Shadow Step / Shadow Crit ──
--- Rapid simultaneous F+Q taps. Z = Shadow Step (standalone), B = Shadow Crit (same mechanic,
--- separately gated so you can bind them to different situations).
+-- ── Shadow Step / Shadow Crit ──
+-- Rapid simultaneous F+Q taps. Z = Shadow Step, B = Shadow Crit (separately gated).
 local function doShadowSequence()
     pcall(function()
         for _ = 1, 3 do
@@ -1060,9 +724,9 @@ local function doShadowSequence()
     end)
 end
 
--- ── v9.4.5 Wing Chun Fake Wiff ──
+-- ── Wing Chun Fake Wiff ──
 -- WC M2 is a counter — it whiffs if your M1 doesn't connect during their windup.
--- We rotate away briefly, fire M1 into empty air, then restore facing. One-shot per registry entry.
+-- Rotate away briefly, fire M1 into empty air, restore facing. One-shot per registry entry.
 local WCFakeWiffActive = false
 local function doWCFakeWiff(targetChar)
     if WCFakeWiffActive then return end
@@ -1077,18 +741,15 @@ local function doWCFakeWiff(targetChar)
             if not targetHrp then return end
 
             local origCFrame = hrp.CFrame
-            -- Face directly away from target so M1 cone misses
             local awayDir = (hrp.Position - targetHrp.Position)
             if awayDir.Magnitude < 0.01 then return end
             awayDir = awayDir.Unit
             hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + awayDir * 10)
 
-            -- Fire M1 into empty air (bait their counter)
             if mouse1click then mouse1click() end
 
             task.wait(tonumber(CFG.WCFakeWiffTime) or 0.18)
 
-            -- Restore original facing
             local lookTarget = hrp.Position + origCFrame.LookVector * 10
             hrp.CFrame = CFrame.new(hrp.Position, lookTarget)
         end)
@@ -1097,11 +758,10 @@ local function doWCFakeWiff(targetChar)
     end)
 end
 
--- ── v9.4.5 Anti Feint state ──
+-- ── Anti Feint state ──
 -- Tracks the regData we last fired on so we can detect its early disappearance (feint).
-local AntiFeintTarget = nil  -- regData reference
+local AntiFeintTarget = nil
 local AntiFeintFireTime = 0
-
 
 -- Exact source formula:
 --   RT  -= half_ping (if ping comp)
@@ -1120,7 +780,7 @@ local function CalculateParryTiming(attackConfig, StartTime, Target)
         optimalReactionTime = optimalReactionTime - CompValue
         if optimalReactionTime < 0 then optimalReactionTime = 0 end
     end
-    -- v9.4.3 consistency: pull BlockStart earlier by jitterShift, extend window by 2 * jitterShift.
+    -- Pull BlockStart earlier by jitterShift, extend window by 2 * jitterShift.
     -- jitterShift grows with ping variance (>40ms range triggers), capped at 25ms shift / +50ms window.
     local jitterShift = 0
     if pingJitter > 40 then
@@ -1151,6 +811,7 @@ local function UpdateAnimationRegistry(animKey, animId, now, currentTrackTime, a
             BlockExpire = blockExpire,
             RandomNum = math.random(1, 100),
             LastExecuteTime = 0,
+            Target = TargetCharacter,  -- for post-fire death validation
         }
     end
 
@@ -1175,9 +836,7 @@ end
 -- Source: BlockStart(regData.BlockStart) — passes the ideal window start as StartTime
 local function ExecuteParry(regData, attackConfig)
     local now = os.clock()
-    if (now - (regData.LastExecuteTime or 0)) < EXECUTE_DEBOUNCE then
-        return
-    end
+    if (now - (regData.LastExecuteTime or 0)) < EXECUTE_DEBOUNCE then return end
     regData.LastExecuteTime = now
 
     if LocalStunned then return end
@@ -1203,10 +862,9 @@ local function ExecuteParry(regData, attackConfig)
     end
 
     if isHeavy then
-        -- v9.4.5 Crit Defense: 50/50 F/Q on heavies, overrides AutoDodge when active
+        -- Crit Defense: 50/50 F/Q on heavies, overrides AutoDodge when active
         if CFG.CritDefense then
             if math.random(1, 2) == 1 then
-                -- Parry branch
                 if LastPendingRegData ~= regData then
                     LastPendingRegData = regData
                     AntiFeintTarget = regData
@@ -1215,7 +873,7 @@ local function ExecuteParry(regData, attackConfig)
                     parryCount = parryCount + 1
                 end
             else
-                Dodge(true)  -- force dodge regardless of AutoDodge
+                Dodge(true)
                 parryCount = parryCount + 1
             end
             if CFG.Debug then
@@ -1234,7 +892,7 @@ local function ExecuteParry(regData, attackConfig)
     -- Identical to source gate
     if LastPendingRegData ~= regData then
         LastPendingRegData = regData
-        -- v9.4.5 Anti Feint: remember what we fired on so cleanup pass can detect early cancel
+        -- Remember what we fired on so cleanup pass can detect early cancel (Anti Feint)
         AntiFeintTarget = regData
         AntiFeintFireTime = now
         BlockStart(regData.BlockStart, CFG.ParryHold)
@@ -1294,15 +952,77 @@ end
 -- ── AnimationTracker ─────────────────────────
 local AnimTrackerInst = nil
 if AnimationTracker and AnimationTracker.new then
-    local ok, inst = pcall(AnimationTracker.new, AnimationTracker, IgnoreIds)
+    -- matcha's .new takes a single IgnoreIds arg (dot-call, not colon)
+    local ok, inst = pcall(AnimationTracker.new, IgnoreIds)
     if ok then AnimTrackerInst = inst end
+end
+
+-- Separate LocalTracker (lolbeans pattern): dedicated tracker for our own character.
+-- Lets us hook AnimationAdded event for ZERO-LATENCY detection of our parry/stun anims.
+-- Without this we polled at 60Hz (up to 16ms lag). With this, event fires the frame
+-- the anim starts.
+local LocalTracker = nil
+if AnimationTracker and AnimationTracker.new then
+    local okL, instL = pcall(AnimationTracker.new, IgnoreIds)
+    if okL then LocalTracker = instL end
+end
+
+-- StunToken: token-based auto-reset of LocalStunned. Each stun bumps the token;
+-- the scheduled recovery only fires if token still matches, so multi-hit stuns
+-- naturally extend recovery time without stacked timers.
+local StunToken = 0
+local function markStunned(duration)
+    LocalStunned = true
+    StunToken = StunToken + 1
+    local myToken = StunToken
+    task.delay(duration or 0.4, function()
+        if myToken == StunToken then
+            LocalStunned = false
+        end
+    end)
+end
+
+-- Event-driven local anim handler — fires the moment a new anim starts on us
+local function onLocalAnimationAdded(anim)
+    if not anim or not anim.AnimationId then return end
+    local animId = tostring(anim.AnimationId)
+
+    -- Our parry stance activated → mark registered immediately (zero latency)
+    if animSetHas(ParryingAnimation, animId) then
+        LocalParrying = true
+        if CurrentParryState == ParryState.INPUT_PENDING then
+            TransitionToState(ParryState.PARRYING)
+            ParryRegisteredTime = os.clock()
+        end
+    end
+
+    -- We got hit → stun with auto-recovery
+    if animSetHas(StunnedAnimation, animId) then
+        markStunned(0.4)
+    end
+
+    -- Parry resolved (success anim or fail anim) → reset to IDLE
+    if animSetHas(ParriedAnimation, animId) or animSetHas(ParryFailedAnimation, animId) then
+        if CurrentParryState ~= ParryState.IDLE then
+            TransitionToState(ParryState.IDLE)
+        end
+    end
+
+    -- NOTE: lolbeans ports a self-M1 lockout here (if GameConfig[animId] then OnStunned()).
+    -- Tested in v9.4.19: catastrophic for actively attacking players. Every M1 we throw
+    -- fires lockout for 0.5s; chained combos extend it continuously → AP permanently
+    -- disabled while attacking. Removed. Game-side priority handles the "F during swing"
+    -- case well enough — we don't need to over-protect from the client side.
+end
+
+if LocalTracker then
+    SyndicatusState:AddConnection(LocalTracker.AnimationAdded:Connect(onLocalAnimationAdded))
 end
 
 local _animScratch = {}
 local function getAnims(character)
     for i = #_animScratch, 1, -1 do _animScratch[i] = nil end
     if not character or not AnimTrackerInst then return _animScratch end
-    -- Guard: Matcha tracker can throw "attempt to index nil with 'X'" on invalid/despawned chars
     if character.Parent == nil then return _animScratch end
     local hrp = character:FindFirstChild("HumanoidRootPart")
     if not hrp then return _animScratch end
@@ -1323,9 +1043,16 @@ local function getAnims(character)
 end
 
 -- ── Rhythm Auto-Hit ───────
--- Hardcoded keys (set these in Gakuran rhythm settings):
---   4-lane: Z  X  ,  .
---   2-lane: F  J
+-- Hardcoded keys: 4-lane = Z X , .  |  2-lane = F J
+--
+-- v9.4.38 — Peak-tracked hold detection.
+-- PRESS when |headY - recY| < Threshold. Classify per note by peak posDelta:
+--   hold  (peak >= HOLD_PEAK)  → release when posDelta <= HOLD_DONE_POSDELTA
+--                                 AND held >= HOLD_MIN_HELD (reason: hold-done)
+--   tap   (peak <  HOLD_PEAK)  → lolbeans style: keypress + wait(0.05) + keyrelease
+-- Swap guard: never swap off a live hold (peak >= HOLD_PEAK AND posDelta > HOLD_DONE_POSDELTA).
+-- Despawn and SAFETY_HELD timeout remain as safety nets.
+-- Peak is seeded from the note's posDelta at PRESS and refreshed each tick while held.
 local Receptors = {
     Receptor1 = "Z",
     Receptor2 = "X",
@@ -1334,8 +1061,20 @@ local Receptors = {
 }
 local ReceptorXMap = {}
 local HeldKeys = {}
+local HeldNotes = {}
+local HeldNoteKeys = {}
+local HeldPressTime = {}
+local HeldPeakPosDelta = {}
+local FinishedNotes = {}
+local DebuggedNotes = {}
 local LastRhythmCache = 0
 local Threshold = 30
+local OFFSCREEN = 2500
+local HOLD_PEAK = 80           -- peak posDelta above baseline → classify as hold
+local HOLD_DONE_POSDELTA = 55  -- trail consumed when posDelta <= this
+local HOLD_MIN_HELD = 0.12     -- min seconds held before hold-done may fire
+local TAP_LEAVE = 15           -- |headY - recY| past this on a tap → tap-done
+local SAFETY_HELD = 10         -- stuck-key force release
 
 local function rhythmKeyByte(key)
     if not key then return nil end
@@ -1344,6 +1083,29 @@ local function rhythmKeyByte(key)
     if key == "." then return 0xBE end
     if #key == 1 then return string.byte(key:upper()) end
     return string.byte(key:sub(1, 1):upper())
+end
+
+local function guiPosY(gui)
+    if not gui then return nil end
+    local y
+    pcall(function() y = gui.AbsolutePosition.Y end)
+    return y
+end
+
+local function forceReleaseLane(rName, reason)
+    local keyB = HeldNoteKeys[rName]
+    local note = HeldNotes[rName]
+    if keyB then pcall(function() keyrelease(keyB) end) end
+    if note then FinishedNotes[note] = true end
+    if CFG.Debug then
+        local heldFor = os.clock() - (HeldPressTime[rName] or os.clock())
+        print(string.format("[Rhythm] RELEASE lane=%s held=%.3fs (%s)", rName, heldFor, reason or "?"))
+    end
+    HeldKeys[rName] = nil
+    HeldNotes[rName] = nil
+    HeldNoteKeys[rName] = nil
+    HeldPressTime[rName] = nil
+    HeldPeakPosDelta[rName] = nil
 end
 
 local function RhythmAutoHitTick()
@@ -1383,7 +1145,6 @@ local function RhythmAutoHitTick()
             Receptors.Receptor3 = ","
             Receptors.Receptor4 = "."
         end
-        -- re-map with updated keys
         table.clear(ReceptorXMap)
         for name, key in pairs(Receptors) do
             local rec = ReceptorLookup:FindFirstChild(name)
@@ -1400,15 +1161,19 @@ local function RhythmAutoHitTick()
         LastRhythmCache = now
     end
 
+    local pressCandidate = {}
+    local laneCurState = {}  -- rName -> { headY, recY, posDelta } for the HeldNotes[rName] note, this tick
+
     for _, note in ipairs(Lanes:GetChildren()) do
         if note.Name ~= "NoteTemplate" then continue end
-        local notePos, noteSize
-        pcall(function()
-            notePos = note.AbsolutePosition
-            noteSize = note.AbsoluteSize
-        end)
-        if not notePos or not noteSize then continue end
-        local noteX = math.floor(notePos.X + noteSize.X / 2)
+        if FinishedNotes[note] then continue end
+
+        local notePos
+        pcall(function() notePos = note.AbsolutePosition end)
+        if not notePos then continue end
+        local noteW = 0
+        pcall(function() noteW = note.AbsoluteSize.X or 0 end)
+        local noteX = math.floor(notePos.X + noteW / 2)
 
         local match
         for rx, data in pairs(ReceptorXMap) do
@@ -1419,53 +1184,145 @@ local function RhythmAutoHitTick()
         end
         if not match or not match.Receptor then continue end
 
-        local receptor = match.Receptor
         local receptorPos
-        pcall(function() receptorPos = receptor.AbsolutePosition end)
+        pcall(function() receptorPos = match.Receptor.AbsolutePosition end)
         if not receptorPos then continue end
         local rName = match.ReceptorName
         local b = match.KeyByte
         if not b then continue end
 
+        local head = note:FindFirstChild("Head")
         local tail = note:FindFirstChild("Tail")
-        local hasTail = false
-        pcall(function()
-            hasTail = tail and tail.AbsoluteSize and tail.AbsoluteSize.Y > 0
-        end)
+        local headY = guiPosY(head) or notePos.Y
+        local tailY = guiPosY(tail)
+        local posDelta = (tailY and headY) and math.abs(tailY - headY) or 0
 
-        if hasTail then
-            local whenHold
-            pcall(function()
-                whenHold = (tail.AbsolutePosition.Y + tail.AbsoluteSize.Y) - receptorPos.Y
-            end)
-            if whenHold and whenHold + 15 > Threshold then
-                if not HeldKeys[rName] then
-                    HeldKeys[rName] = true
-                    pcall(function() keypress(b) end)
-                end
+        if math.abs(headY - receptorPos.Y) > OFFSCREEN then
+            continue
+        end
+
+        if CFG.Debug and not DebuggedNotes[note] then
+            if math.abs(headY - receptorPos.Y) < Threshold * 3 then
+                DebuggedNotes[note] = true
+                print(string.format(
+                    "[Rhythm] NOTE lane=%s headY=%.1f recY=%.1f posDelta=%.1f",
+                    rName, headY, receptorPos.Y, posDelta
+                ))
             end
-            if HeldKeys[rName] then
-                local release = false
-                pcall(function()
-                    release = (tail.AbsolutePosition.Y - receptorPos.Y) > 0
-                end)
-                if release then
-                    HeldKeys[rName] = nil
-                    pcall(function() keyrelease(b) end)
+        end
+
+        -- Held note on this lane: update peak + stash current geometry, never a press candidate
+        if HeldNotes[rName] == note then
+            if posDelta > (HeldPeakPosDelta[rName] or 0) then
+                HeldPeakPosDelta[rName] = posDelta
+            end
+            laneCurState[rName] = { headY = headY, recY = receptorPos.Y, posDelta = posDelta }
+            continue
+        end
+
+        if math.abs(headY - receptorPos.Y) < Threshold then
+            local cur = pressCandidate[rName]
+            if not cur or math.abs(headY - receptorPos.Y) < math.abs(cur.headY - cur.recY) then
+                pressCandidate[rName] = {
+                    note = note, b = b, headY = headY, recY = receptorPos.Y, posDelta = posDelta,
+                }
+            end
+        end
+    end
+
+    -- Release pass
+    -- 1) Despawn: note gone from Lanes
+    for rName, heldNote in pairs(HeldNotes) do
+        if not heldNote or not heldNote.Parent then
+            forceReleaseLane(rName, "despawn")
+        end
+    end
+    -- 2) Classification-driven release + safety
+    --    HOLDS: hold-done when trail drains (peak path)
+    --    TAPS:  self-release inside the press spawn (lolbeans style) — no geometry release here
+    for rName, _ in pairs(HeldNotes) do
+        local heldFor = now - (HeldPressTime[rName] or now)
+        if heldFor > SAFETY_HELD then
+            forceReleaseLane(rName, "safety")
+        else
+            local cur = laneCurState[rName]
+            if cur then
+                local peak = HeldPeakPosDelta[rName] or 0
+                if peak >= HOLD_PEAK then
+                    -- real hold: wait for trail to drain
+                    if cur.posDelta <= HOLD_DONE_POSDELTA and heldFor >= HOLD_MIN_HELD then
+                        forceReleaseLane(rName, "hold-done")
+                    end
                 end
+                -- taps: do nothing here; 50ms self-release already ran at PRESS
+            end
+        end
+    end
+
+    -- Press pass
+    -- TAP  (posDelta < HOLD_PEAK): lolbeans style — keypress, wait 0.05, keyrelease (once per note)
+    -- HOLD (posDelta >= HOLD_PEAK): hold key until hold-done / despawn; never swap mid-trail
+    for rName, cand in pairs(pressCandidate) do
+        local note = cand.note
+        if FinishedNotes[note] then continue end
+        if HeldKeys[rName] == note then continue end
+
+        local isHold = (cand.posDelta or 0) >= HOLD_PEAK
+
+        if isHold then
+            if HeldKeys[rName] then
+                local peak = HeldPeakPosDelta[rName] or 0
+                local cur = laneCurState[rName]
+                local activeHold = (peak >= HOLD_PEAK and cur and cur.posDelta > HOLD_DONE_POSDELTA)
+                if activeHold then
+                    continue  -- live hold still has trail
+                end
+                forceReleaseLane(rName, "swap")
+            end
+
+            HeldKeys[rName] = note
+            HeldNotes[rName] = note
+            HeldNoteKeys[rName] = cand.b
+            HeldPressTime[rName] = now
+            HeldPeakPosDelta[rName] = cand.posDelta or 0
+            pcall(function() keypress(cand.b) end)
+            if CFG.Debug then
+                print(string.format(
+                    "[Rhythm] PRESS HOLD lane=%s headY=%.1f posDelta=%.1f",
+                    rName, cand.headY, cand.posDelta or 0
+                ))
             end
         else
-            if math.abs(notePos.Y - receptorPos.Y) < Threshold then
-                if HeldKeys[rName] then
-                    pcall(function() keyrelease(b) end)
-                    HeldKeys[rName] = nil
+            -- TAP: lolbeans AutoPlayTask path — crisp 50ms press, once per note instance
+            if HeldKeys[rName] then
+                local peak = HeldPeakPosDelta[rName] or 0
+                local cur = laneCurState[rName]
+                if peak >= HOLD_PEAK and cur and cur.posDelta > HOLD_DONE_POSDELTA then
+                    continue  -- don't interrupt a live hold on this lane
                 end
-                task.spawn(function()
-                    pcall(function() keypress(b) end)
-                    task.wait(0.05)
-                    pcall(function() keyrelease(b) end)
-                end)
+                forceReleaseLane(rName, "swap")
             end
+
+            FinishedNotes[note] = true  -- one shot — prevents multi-frame re-press spam
+            local b = cand.b
+            task.spawn(function()
+                pcall(function() keypress(b) end)
+                task.wait(0.05)
+                pcall(function() keyrelease(b) end)
+            end)
+            if CFG.Debug then
+                print(string.format(
+                    "[Rhythm] PRESS TAP lane=%s headY=%.1f posDelta=%.1f",
+                    rName, cand.headY, cand.posDelta or 0
+                ))
+            end
+        end
+    end
+
+    for n, _ in pairs(FinishedNotes) do
+        if not n or not n.Parent then
+            FinishedNotes[n] = nil
+            DebuggedNotes[n] = nil
         end
     end
 end
@@ -1514,7 +1371,7 @@ local function cycleTargets()
     if CFG.MultiTarget then
         for i=1,math.min(3,#_valid) do table.insert(_finals,_valid[i].c) end
     elseif CFG.AutoTargetNearest and #_valid > 0 then
-        table.insert(_finals, _valid[1].c)  -- nearest only
+        table.insert(_finals, _valid[1].c)
     elseif #_valid > 0 then
         -- keep previous lock if still valid, else nearest
         local prev = TargetCharacters[1]
@@ -1537,14 +1394,12 @@ local UnknownLog = {} local UnknownOrder = {}
 
 -- ── Anti-AFK + Auto-Respawn state ───────────
 local lastAFKPing = 0
-local pendingRespawn = nil  -- os.clock() of death, nil if alive
+local pendingRespawn = nil
 
--- wire up death detection whenever character spawns
 local function hookCharacter(character)
     if not character then return end
     local humanoid = character:FindFirstChildWhichIsA("Humanoid")
     if not humanoid then
-        -- wait a moment and retry
         character.ChildAdded:Connect(function(child)
             if child:IsA("Humanoid") then
                 child.Died:Connect(function()
@@ -1563,23 +1418,99 @@ local function hookCharacter(character)
     end)
 end
 
--- hook current + future characters
 pcall(function()
     if LocalPlayer.Character then hookCharacter(LocalPlayer.Character) end
     LocalPlayer.CharacterAdded:Connect(function(c)
-        pendingRespawn = nil  -- reset on respawn
+        pendingRespawn = nil
         hookCharacter(c)
     end)
 end)
 
--- ── MAIN LOOP — same AP path as source (RenderStepped, no rate limit) ──
--- Non-AP utilities moved to a light Heartbeat so RS stays lean.
+-- ── MAIN LOOP (RenderStepped — same AP path as source) ──
 SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
     local now = os.clock()
+
+    -- Drive LocalTracker at render rate — this makes AnimationAdded fire instantly
+    -- on new local anims (parry stance, stun, our own M1s). Without this, the event
+    -- never triggers because matcha needs Update() to detect new animations.
+    if LocalTracker then
+        local lc = LocalPlayer.Character
+        if lc and lc.Parent then
+            pcall(function() LocalTracker:Update(lc) end)
+        end
+    end
+
+    -- Local-player health exit: no reason to run AP when we're dead or 0 HP
+    do
+        local lc = LocalPlayer.Character
+        local hum = lc and lc:FindFirstChildWhichIsA("Humanoid")
+        if not hum or hum.Health <= 0 then
+            if KeyHeld then BlockEnd() end
+            return
+        end
+    end
 
     -- Source ParryTask: release when past deadline
     if KeyHeld and ReleaseDeadline > 0 and now >= ReleaseDeadline then
         BlockEnd()
+    end
+
+    -- Crispy release: parry already registered successfully (game played parry anim on us).
+    -- No reason to keep F held past this — holding = blocking stance = slower movement.
+    -- Releasing here returns full walkspeed in ~50-100ms instead of waiting the full 270ms.
+    if KeyHeld and CurrentParryState == ParryState.PARRYING then
+        BlockEnd()
+    end
+
+    -- Stun release: if we got hit, holding F during stun just leaves us visibly locked.
+    -- Release so character returns to normal state as stun ends.
+    if KeyHeld and LocalStunned then
+        BlockEnd()
+    end
+
+    -- Resolution catchall: if the parry attempt resolved to IDLE for ANY reason while F is
+    -- still held, release. Covers ParryFailed anims (our parry failed, we got hit through it),
+    -- Parried anims (counter-parried mid-swing), and any other state-to-IDLE transition.
+    -- Lets AP immediately re-fire on the next incoming hit in a combo instead of being stuck
+    -- holding F from a dead attempt. INPUT_PENDING is intentionally excluded — that's the
+    -- "waiting for parry to register" state, we hold F through it until deadline or detection.
+    if KeyHeld and CurrentParryState == ParryState.IDLE then
+        BlockEnd()
+    end
+
+    -- Early release: F held but attacker can't hit us anymore.
+    -- Covers three cases:
+    --   1. Target despawned (character cleaned up)
+    --   2. Target died (health <= 0)
+    --   3. Target left AP range (dashed/retreated out of reach mid-swing)
+    -- Any of these = release F immediately so we're ready for the next real threat
+    -- instead of standing there blocking a ghost.
+    if KeyHeld and LastPendingRegData and LastPendingRegData.Target then
+        local pendingTarget = LastPendingRegData.Target
+        local shouldRelease = false
+        if not pendingTarget.Parent then
+            shouldRelease = true
+        else
+            local hum = pendingTarget:FindFirstChildWhichIsA("Humanoid")
+            if not hum or hum.Health <= 0 then
+                shouldRelease = true
+            else
+                local hrp = pendingTarget:FindFirstChild("HumanoidRootPart")
+                local lc = LocalPlayer.Character
+                local lr = lc and lc:FindFirstChild("HumanoidRootPart")
+                if hrp and lr then
+                    local d = (lr.Position - hrp.Position).Magnitude
+                    -- 3 stud tolerance: smart gate can fire from APRange+3 on dash-ins,
+                    -- release boundary extends to match so we don't flicker release/press
+                    if d > (CFG.APRange or 10) + 3 then
+                        shouldRelease = true
+                    end
+                end
+            end
+        end
+        if shouldRelease then
+            BlockEnd()
+        end
     end
 
     -- Rhythm stays on RS for note accuracy (only when enabled)
@@ -1587,10 +1518,10 @@ SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
         pcall(RhythmAutoHitTick)
     end
 
-    -- ── AP eval (unchanged logic) ──
+    -- ── AP eval ──
     if not CFG.Enabled then return end
     if not AnimTrackerInst then return end
-    -- v9.4.3: early-exit when stunned — can't parry anyway, skip the whole target+anim scan
+    -- Early-exit when stunned — can't parry anyway, skip the whole target+anim scan
     if LocalStunned then return end
     local lc = LocalPlayer.Character
     local lr = lc and lc:FindFirstChild("HumanoidRootPart")
@@ -1604,12 +1535,31 @@ SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
 
     for ti = 1, nTargets do
         local c = targets[ti]
+        if not c.Parent then continue end
         local tr = c:FindFirstChild("HumanoidRootPart")
         if not tr then continue end
+        -- Live health check — cycleTargets runs 10Hz so dead targets could linger up to 100ms.
+        -- Attack animations can persist through ragdoll, triggering phantom parries.
+        local hum = c:FindFirstChildWhichIsA("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
         local dist = (lr.Position - tr.Position).Magnitude
-        if dist > apRange then continue end
 
-        local charKey = tostring(c)  -- Instance tostring is stable for its lifetime
+        -- Smart range gate: fire if in reach OR genuinely approaching fast enough to BE in reach soon.
+        -- A static distance cutoff looks sus from far away (nobody human reacts to attacks that
+        -- can't hit them yet). Velocity-aware check catches dash-ins without firing on stationary
+        -- distant targets.
+        if dist > apRange then
+            local toUs = lr.Position - tr.Position
+            local toUsMag = toUs.Magnitude
+            if toUsMag < 0.01 then continue end
+            local closingSpeed = tr.AssemblyLinearVelocity:Dot(toUs / toUsMag)
+            if closingSpeed <= 5 then continue end           -- not approaching
+            local timeToReach = (dist - apRange) / closingSpeed
+            if timeToReach > 0.3 then continue end           -- too far ahead to commit
+            -- Passed: attacker is sprinting into reach, legit read
+        end
+
+        local charKey = tostring(c)
         local anims = getAnims(c)
         if doDebug and (now - debugLastPrint) > 2 then
             debugLastPrint = now
@@ -1644,7 +1594,7 @@ SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
             local regData = UpdateAnimationRegistry(animKey, animId, now, anim.pos or 0, config, c)
             if regData.Processed then continue end
 
-            -- v9.4.5 WC Fake Wiff: intercept WingChun M2 counter before ForceParry fires
+            -- WC Fake Wiff: intercept WingChun M2 counter before ForceParry fires
             if CFG.WCFakeWiff and config.ForceParry and config.Style == "WingChunAnims" then
                 if not regData.FakeWiffDone then
                     regData.FakeWiffDone = true
@@ -1692,9 +1642,8 @@ SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
                 continue
             end
 
-            -- v9.4.3 live recompute, v9.4.4 throttled to every 3rd RS frame.
+            -- Live recompute throttled to every 3rd RS frame.
             -- At 240Hz: ~12ms refresh — well inside ParryWindow (default 200ms) and jitter headroom.
-            -- Initial values from UpdateAnimationRegistry are already fresh, so skipping frames 1-2 is safe.
             -- LastPendingRegData gate catches post-fire shifts — recompute cannot double-fire.
             regData._recomputeFrame = (regData._recomputeFrame or 0) + 1
             if regData._recomputeFrame >= 3 then
@@ -1714,7 +1663,7 @@ SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
     -- Cleanup registry entries whose animations stopped
     for key, val in pairs(AnimationRegistry) do
         if not currentActiveIds[key] then
-            -- v9.4.5 Anti Feint: fired-upon attack vanished before parry registered → it was a feint
+            -- Anti Feint: fired-upon attack vanished before parry registered → feint, release early
             if CFG.AntiFeint and KeyHeld and val == AntiFeintTarget and not LocalParrying then
                 local sinceFire = now - AntiFeintFireTime
                 if sinceFire < 0.4 then
@@ -1785,34 +1734,31 @@ SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Local stun / parry state from own-character anim list (moved from RS for consistency under movement).
-    -- v9.4.4: skip entirely when AP is disabled — matcha Update is the single biggest HB cost.
+    -- HB local scan: BACKUP for the event-driven LocalTracker.AnimationAdded detection.
+    -- Primary purpose: clear LocalParrying when parry anim ends (events don't fire on end),
+    -- and safety-clear LocalStunned if nothing is actually stunning us right now (prevents
+    -- the StunToken timer from leaving us flagged if something glitches).
     if CFG.Enabled then
-        LocalStunned = false
-        LocalParrying = false
         local char = LocalPlayer.Character
         if char then
             local anims = getAnims(char)
+            local stillParrying = false
+            local stillStunned = false
             for i = 1, #anims do
                 local a = anims[i]
                 local id = a and a.id
                 if id then
-                    if animSetHas(StunnedAnimation, id) then
-                        LocalStunned = true
-                    end
-                    if animSetHas(ParryingAnimation, id) then
-                        LocalParrying = true
-                        if CurrentParryState == ParryState.INPUT_PENDING then
-                            TransitionToState(ParryState.PARRYING)
-                            ParryRegisteredTime = now
-                        end
-                    end
-                    if animSetHas(ParriedAnimation, id) or animSetHas(ParryFailedAnimation, id) then
-                        if CurrentParryState ~= ParryState.IDLE then
-                            TransitionToState(ParryState.IDLE)
-                        end
-                    end
+                    if animSetHas(ParryingAnimation, id) then stillParrying = true end
+                    if animSetHas(StunnedAnimation, id) then stillStunned = true end
                 end
+            end
+            if LocalParrying and not stillParrying then
+                LocalParrying = false
+            end
+            -- Safety: if nothing is stunning us right now, let the stun flag clear
+            -- instead of waiting the full StunToken duration. Prevents "stuck stunned" bug.
+            if LocalStunned and not stillStunned then
+                LocalStunned = false
             end
         end
     else
@@ -1841,8 +1787,8 @@ SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Target cycle + label (0.5s like source utility tick)
-    if (now - lastCycle) >= 0.5 then
+    -- Target cycle — 10Hz for fast new-enemy detection (was 2Hz source default)
+    if (now - lastCycle) >= 0.1 then
         lastCycle = now
         pcall(cycleTargets)
         if TargetLabel then
@@ -1883,22 +1829,19 @@ local UI_Window = UI_Library:CreateWindow({
 })
 
 -- Pure black section/panel fill (kills grey wash)
--- SetPerformance here is driven by menu visibility (see syncMenuPerformance below).
+-- SetPerformance is driven by menu visibility (see syncMenuPerformance below).
 local function applyDarkTheme()
     pcall(function()
         if UI_Library.SetOpacity then UI_Library:SetOpacity(1) end
         if UI_Library.SetTheme then
-            UI_Library:SetTheme({
-                Background = Color3.fromRGB(0, 0, 0),
-            })
+            UI_Library:SetTheme({ Background = Color3.fromRGB(0, 0, 0) })
         end
     end)
 end
 
--- v9.4.4 menu auto-perf: INS tweens have real GPU cost when menu is open.
--- SetPerformance(true) = tweens disabled = faster. We want that when menu is hidden
--- (fighting), and tweens enabled when menu is visible (user is interacting).
-local menuVisible = true  -- INS creates the window visible on inject
+-- Menu auto-perf: INS tweens have GPU cost when menu is open.
+-- SetPerformance(true) = tweens disabled = faster. We want that when menu is hidden.
+local menuVisible = true
 local function syncMenuPerformance()
     pcall(function()
         if UI_Library and UI_Library.SetPerformance then
@@ -1906,10 +1849,47 @@ local function syncMenuPerformance()
         end
     end)
 end
+
+-- Input gating: when menu is visible, swallow user's physical keys so they don't
+-- leak into the game. Fingers hitting WASD/F while browsing the menu would
+-- fight AP's synthetic input and mess up character position. AP keys go through
+-- VirtualInputManager which bypasses this entirely — they still fire at full speed.
+local gameInputEnabled = true
+local function applyGameInput()
+    -- PlayerModule controls (WASD / jump / sprint) — survives respawn, re-apply via CharacterAdded hook
+    pcall(function()
+        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+        if not playerScripts then return end
+        local playerModule = playerScripts:FindFirstChild("PlayerModule")
+        if not playerModule then return end
+        local module = require(playerModule)
+        local controls = module:GetControls()
+        if gameInputEnabled then
+            controls:Enable()
+        else
+            controls:Disable()
+        end
+    end)
+    -- Executor passthrough (keypress/keyrelease from physical keys to game)
+    pcall(function() setrobloxinput(gameInputEnabled) end)
+end
+
+local function setGameInputEnabled(enabled)
+    gameInputEnabled = enabled
+    applyGameInput()
+end
+
+-- Re-apply input state on respawn (PlayerModule resets controls on new character)
+pcall(function()
+    LocalPlayer.CharacterAdded:Connect(function()
+        task.wait(0.5)  -- let the character fully load before touching controls
+        applyGameInput()
+    end)
+end)
+
 applyDarkTheme()
 
--- Menu background — INS draws this ABOVE section cards (z ~119999).
--- High alpha = grey wash over everything. Keep low so black panels read solid.
+-- Menu background — INS draws this ABOVE section cards. Keep alpha low so black panels read solid.
 local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/syndicatusAP/main/content.png"
 local function applyMenuBackground()
     pcall(function()
@@ -1947,7 +1927,7 @@ local _refreshingDrop = false
 local function sanitizeName(t)
     if t == nil then return nil end
     t = tostring(t):gsub('[/\\:*?"<>|]',""):gsub("^%s+",""):gsub("%s+$",""):sub(1,40)
-    if t == "" or t:sub(1,3) == "[G]" then return nil end
+    if t == "" then return nil end
     return t
 end
 
@@ -2019,10 +1999,7 @@ ProfileDrop = ProfilesSec:Dropdown("Load / Delete target",nil,listProfiles,false
     if type(l)=="table" then s = l[1] or l.Value or l.Selected or l.Name end
     if type(s)=="string" and #s>0 then
         selectedConfig = s
-        -- Selecting a real profile also becomes the Save target (not stuck on Default)
-        if s:sub(1, 3) ~= "[G]" then
-            setSaveName(s, true)
-        end
+        setSaveName(s, true)
     end
 end)
 pcall(function()
@@ -2043,28 +2020,23 @@ local function applySettings(s)
     if s.CycleRange        then CFG.CycleRange=s.CycleRange   setSlider(UIRefs.CycleRange,s.CycleRange) end
     if s.APRange           then CFG.APRange=s.APRange         setSlider(UIRefs.APRange,s.APRange) end
     if s.ParryOffset ~=nil then CFG.ParryOffset=s.ParryOffset setSlider(UIRefs.ParryOffset,s.ParryOffset) end
-    -- v9.4.6: ParryHold + ParryWindow are hard-locked to source defaults. Legacy profiles
-    -- that stored custom values are intentionally ignored here — don't let a bad save poison
-    -- the AP timing. Users who want to tune these should modify CFG defaults in source.
     if s.ProbabilityToParry then CFG.ProbabilityToParry=s.ProbabilityToParry setSlider(UIRefs.ProbabilityToParry,s.ProbabilityToParry) end
     if s.PingCompensate  ~=nil then CFG.PingCompensate=s.PingCompensate setToggle(UIRefs.PingCompensate,s.PingCompensate) end
     if s.AutoTargetNearest~=nil then CFG.AutoTargetNearest=s.AutoTargetNearest setToggle(UIRefs.AutoTargetNearest,s.AutoTargetNearest) end
     if s.RhythmAutoHit   ~=nil then CFG.RhythmAutoHit=s.RhythmAutoHit setToggle(UIRefs.RhythmAutoHit,s.RhythmAutoHit) end
-        -- facing conditions
+    -- Facing conditions
     if s.TargetFacingYou ~=nil then CFG.TargetFacingYou=s.TargetFacingYou setToggle(UIRefs.TargetFacingYou,s.TargetFacingYou) end
     if s.YouFacingTarget ~=nil then CFG.YouFacingTarget=s.YouFacingTarget  setToggle(UIRefs.YouFacingTarget,s.YouFacingTarget) end
-    -- v9.4.7: FacingThreshold hard-locked to 0.1 — legacy save values ignored
     if s.AutoHeight      ~=nil then CFG.AutoHeight=s.AutoHeight            setToggle(UIRefs.AutoHeight,s.AutoHeight) end
     if s.HeightInfluence ~=nil then CFG.HeightInfluence=s.HeightInfluence  setSlider(UIRefs.HeightInfluence,s.HeightInfluence) end
-    -- v9.4.5 feature pack
+    -- Tech pack
     if s.AntiFeint     ~=nil then CFG.AntiFeint=s.AntiFeint             setToggle(UIRefs.AntiFeint,s.AntiFeint) end
     if s.CritDefense   ~=nil then CFG.CritDefense=s.CritDefense         setToggle(UIRefs.CritDefense,s.CritDefense) end
     if s.WCFakeWiff    ~=nil then CFG.WCFakeWiff=s.WCFakeWiff           setToggle(UIRefs.WCFakeWiff,s.WCFakeWiff) end
     if s.WCFakeWiffTime      then CFG.WCFakeWiffTime=s.WCFakeWiffTime   setSlider(UIRefs.WCFakeWiffTime,s.WCFakeWiffTime) end
     if s.ShadowStep    ~=nil then CFG.ShadowStep=s.ShadowStep           setToggle(UIRefs.ShadowStep,s.ShadowStep) end
     if s.ShadowCrit    ~=nil then CFG.ShadowCrit=s.ShadowCrit           setToggle(UIRefs.ShadowCrit,s.ShadowCrit) end
-    -- v9.4.7: PersonalHP/OpponentHP/HPViewRange/LowLagMode stripped — ignored silently from legacy saves
-    -- misc
+    -- Misc
     if s.SoundOnParry    ~=nil then CFG.SoundOnParry=s.SoundOnParry end
     if s.AntiAFK         ~=nil then CFG.AntiAFK=s.AntiAFK                 setToggle(UIRefs.AntiAFK,s.AntiAFK) end
     if s.AFKInterval           then CFG.AFKInterval=s.AFKInterval           setSlider(UIRefs.AFKInterval,s.AFKInterval) end
@@ -2076,21 +2048,16 @@ local function applySettings(s)
 end
 
 ProfilesSec:Button("Save Current",function()
-    -- Save target:
-    -- 1) Dropdown selection if it is a real writable profile (not Default, not [G])
-    -- 2) Otherwise the typed "Will save as" name
-    -- Selecting a profile in the dropdown also updates currentName, so overwrites work.
+    -- Save target: dropdown selection if it's a real writable profile, else the typed name
     local name = nil
     if type(selectedConfig) == "string"
         and selectedConfig ~= ""
-        and selectedConfig ~= "Default"
-        and selectedConfig:sub(1, 3) ~= "[G]" then
+        and selectedConfig ~= "Default" then
         name = sanitizeName(selectedConfig)
     end
     if not name then
         name = sanitizeName(currentName)
     end
-    -- Still allow explicitly saving a file named Default if the user typed it
     if not name and selectedConfig == "Default" and currentName == "Default" then
         name = "Default"
     end
@@ -2102,7 +2069,6 @@ ProfilesSec:Button("Save Current",function()
     selectedConfig = name
     local t = {}
     for id,info in pairs(GameConfig) do t[id]=info.ReactionTime or DefaultRT end
-    -- Force-read live pill key into CFG before encoding
     local kb = "g"
     pcall(function()
         if APToggleElement and APToggleElement.Bind and type(APToggleElement.Bind.Value) == "string"
@@ -2116,30 +2082,23 @@ ProfilesSec:Button("Save Current",function()
     local payload = {
         Timings=t,
         Settings={
-            -- toggles
             Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
             MultiTarget=CFG.MultiTarget,
             Debug=CFG.Debug,
-            -- facing conditions
             TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
-            -- height
             AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
-            -- v9.4.5 feature pack
             AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
             WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
             ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
-            -- ranges + timing
             CycleRange=CFG.CycleRange, APRange=CFG.APRange,
             ParryOffset=CFG.ParryOffset,  -- Hold+Window hard-locked; not saved
             ProbabilityToParry=CFG.ProbabilityToParry,
             PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
             RhythmAutoHit=CFG.RhythmAutoHit,
             DefaultRT=DefaultRT, APKeybind=CFG.APKeybind,
-            -- misc
             SoundOnParry=CFG.SoundOnParry,
             AntiAFK=CFG.AntiAFK, AFKInterval=CFG.AFKInterval,
             AutoRespawn=CFG.AutoRespawn, RespawnDelay=CFG.RespawnDelay,
-            -- compat
             AutoParryRange=CFG.APRange,
         },
     }
@@ -2175,7 +2134,7 @@ ProfilesSec:Button("Load Selected",function()
         end
     end
     applySettings(data.Settings or data)
-    if selectedConfig:sub(1,3)~="[G]" then setSaveName(selectedConfig,true) end
+    setSaveName(selectedConfig,true)
     if bindStyle then pcall(bindStyle,currentStyleEdit) end
     local loadedKb = tostring(CFG.APKeybind or "?")
     UI_Library:Notify("Profiles","Loaded: "..selectedConfig.." ("..n.." timings, AP key: "..loadedKb..")")
@@ -2183,7 +2142,6 @@ end)
 
 ProfilesSec:Button("Delete Selected",function()
     if not selectedConfig or selectedConfig=="" then UI_Library:Notify("Profiles","Nothing selected") return end
-    if selectedConfig:sub(1,3)=="[G]" then UI_Library:Notify("Profiles","Cannot delete [G] configs") return end
     if selectedConfig=="Default" and not profileSourceMap["Default"] then
         UI_Library:Notify("Profiles","Default is built-in") return
     end
@@ -2211,12 +2169,11 @@ ProfilesSec:Button("Reset Timings (built-in)",function()
     UI_Library:Notify("Profiles","Timings reset")
 end)
 
--- ── v9.4.3 config sharing ──
+-- ── Config sharing ──
 ProfilesSec:Divider("Share")
 ProfilesSec:Info("Export your timings+settings to clipboard, or import someone else's")
 
 local function buildSharePayload()
-    -- Pull live keybind from pill
     local kb = "g"
     pcall(function()
         if APToggleElement and APToggleElement.Bind and type(APToggleElement.Bind.Value) == "string"
@@ -2230,14 +2187,13 @@ local function buildSharePayload()
     local t = {}
     for id, info in pairs(GameConfig) do t[id] = info.ReactionTime or DefaultRT end
     return {
-        _format = "syndicatus-share-v1",  -- importer accepts legacy "olympus-share-v1" too
+        _format = "syndicatus-share-v1",  -- importer also accepts legacy "olympus-share-v1"
         Timings = t,
         Settings = {
             Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
             MultiTarget=CFG.MultiTarget, Debug=CFG.Debug,
             TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
             AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
-            -- v9.4.5 feature pack
             AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
             WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
             ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
@@ -2307,7 +2263,6 @@ ProfilesSec:Button("Import from Clipboard", function()
         "Imported %d timings (%d skipped), %d settings", tApplied, tMissing, sApplied))
 end)
 
--- URL fetch (raw GitHub gist, pastebin raw, etc.)
 local pendingUrl = ""
 do
     local made = false
@@ -2345,9 +2300,7 @@ end)
 
 -- Armed
 ArmedSec:Info("Auto-targets nearby players every 0.5s")
--- ── AP arm toggle + INS keybind pill (Toggle mode) ──
 -- INS stores the bind on the ROW: toggle.Bind = { Value = "g", Mode = "Toggle", ... }
--- Left-click pill = rebind (updates Bind.Value). Right-click = mode.
 local APToggleElement = ArmedSec:Toggle("Auto Parry", true, function(v)
     CFG.Enabled = v and true or false
 end)
@@ -2368,7 +2321,6 @@ ArmedSec:Info("OFF = you parry/dodge Boxing M2 yourself. ON = AP block→dodge s
 UIRefs.MultiTarget = ArmedSec:Toggle("Multiple Targets", true, function(v) CFG.MultiTarget = v end)
 UIRefs.AutoTargetNearest = ArmedSec:Toggle("Auto Target Nearest", true, function(v) CFG.AutoTargetNearest = v end)
 
--- Read/write the live pill via toggle.Bind.Value (INS internal)
 readAPKeybind = function()
     local k = nil
     pcall(function()
@@ -2410,7 +2362,6 @@ SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
             if type(k) == "string" and #k > 0 and k ~= "none" then
                 CFG.APKeybind = k
             end
-            -- force Toggle mode if user right-clicked to Hold
             if APToggleElement.Bind.Mode and APToggleElement.Bind.Mode ~= "Toggle" then
                 APToggleElement.Bind.Mode = "Toggle"
             end
@@ -2421,8 +2372,6 @@ end))
 CondSec:Info("Gate parry per target based on facing direction")
 UIRefs.TargetFacingYou=CondSec:Toggle("Target facing you",false,function(v) CFG.TargetFacingYou=v end)
 UIRefs.YouFacingTarget=CondSec:Toggle("You facing target",true,function(v) CFG.YouFacingTarget=v end)
--- v9.4.7: Facing Angle slider removed. Source uses 0.1 as a constant threshold.
--- Still read from CFG.FacingThreshold (locked at init) so the condition toggles above still work.
 CondSec:Info("Facing angle locked to source default (0.1 dot)")
 UIRefs.AutoHeight = CondSec:Toggle("Automatic Height Timing", true, function(v) CFG.AutoHeight = v end)
 UIRefs.HeightInfluence = CondSec:Slider("Height Influence", 1, 0.05, 0, 2, "x", function(v) CFG.HeightInfluence = tonumber(v) or 1 end)
@@ -2430,10 +2379,12 @@ UIRefs.HeightInfluence:Set(1)
 CondSec:Info("BodyHeightScale only. 1x = full effect")
 
 TargetLabel = TargetSec:Label("Locked: (none)")
-UIRefs.CycleRange = TargetSec:Slider("Cycle Range",20,1,5,60,"s",function(v) CFG.CycleRange=v end)
+UIRefs.CycleRange = TargetSec:Slider("Cycle Range",20,1,5,60,"studs",function(v) CFG.CycleRange=v end)
 UIRefs.CycleRange:Set(CFG.CycleRange)
-UIRefs.APRange = TargetSec:Slider("AP Range",10,1,5,60,"s",function(v) CFG.APRange=v end)
-UIRefs.APRange:Set(10)
+UIRefs.APRange = TargetSec:Slider("AP Range",11,1,5,60,"studs",function(v) CFG.APRange=v end)
+UIRefs.APRange:Set(11)
+TargetSec:Info("Primary parry range — kept tight so AP doesn't fire sus from far away")
+TargetSec:Info("Smart gate still fires on fast-approaching attackers within 0.3s of reach")
 
 UIRefs.Debug = EngineSec:Toggle("Debug Parry",false,function(v)
     CFG.Debug=v
@@ -2441,15 +2392,12 @@ UIRefs.Debug = EngineSec:Toggle("Debug Parry",false,function(v)
 end)
 UIRefs.ParryOffset = EngineSec:Slider("Parry Offset",0,0.001,-0.15,0.15,"s",function(v) CFG.ParryOffset=tonumber(v) or 0 end)
 UIRefs.ParryOffset:Set(0)
--- Parry Hold (0.27s) and Parry Window (0.20s) are hard-locked to source defaults.
--- These are source-constants not meant for user tuning; exposing them historically caused
--- misconfigured ACs to blame the script. See CFG.ParryHold / CFG.ParryWindow.
 UIRefs.ProbabilityToParry = EngineSec:Slider("Probability To Parry",100,1,1,100,"%",function(v) CFG.ProbabilityToParry=tonumber(v) or 100 end)
 UIRefs.ProbabilityToParry:Set(100)
 UIRefs.PingCompensate = EngineSec:Toggle("Ping Compensation", true, function(v) CFG.PingCompensate=v end)
 EngineSec:Info("Ping Comp subtracts half your ping from reaction time.")
 EngineSec:Info("Hold=0.27s / Window=0.20s locked to source defaults.")
-EngineSec:Info("v9.4 uses open-source continuous registry (no global CD).")
+EngineSec:Info("Continuous registry (no global CD).")
 
 DebugSec:Label("Enable Debug Parry to see prints + notifs")
 DebugSec:Button("Copy Unknown IDs",function()
@@ -2516,7 +2464,6 @@ bindStyle = function(styleName)
     table.sort(collected, function(a, b)
         local function rank(name)
             name = tostring(name or "")
-            -- Current set (no suffix) first, then A, B, special names
             if name:find("%(A%)") then return 2, name end
             if name:find("%(B%)") then return 3, name end
             if name:find("Feint") then return 4, name end
@@ -2584,11 +2531,11 @@ do
 end
 bindStyle(currentStyleEdit)
 
--- ── Techs Tab (v9.4.5) ────────────────────────
-local AntiFeintSec   = TechsTab:Section("Anti Feint","Left")
-local CritDefSec     = TechsTab:Section("Crit Defense","Left")
-local WCFakeSec      = TechsTab:Section("Wing Chun Fake Wiff","Right")
-local ShadowSec      = TechsTab:Section("Shadow Techs","Right")
+-- ── Techs Tab ────────────────────────
+local AntiFeintSec = TechsTab:Section("Anti Feint","Left")
+local CritDefSec   = TechsTab:Section("Crit Defense","Left")
+local WCFakeSec    = TechsTab:Section("Wing Chun Fake Wiff","Right")
+local ShadowSec    = TechsTab:Section("Shadow Techs","Right")
 
 AntiFeintSec:Info("Releases F if the fired-upon attack cancels before parry registers")
 UIRefs.AntiFeint = AntiFeintSec:Toggle("Anti Feint", false, function(v) CFG.AntiFeint = v end)
@@ -2618,12 +2565,8 @@ local AntiAFKSec  = SettingsTab:Section("Anti-AFK","Left")
 local RespawnSec  = SettingsTab:Section("Auto Respawn","Right")
 local SessionSec  = SettingsTab:Section("Session","Right")
 
-
--- Misc
 MiscSec:Info("Misc quality-of-life options")
-MiscSec:Toggle("Sound on Parry",false,function(v)
-    CFG.SoundOnParry=v
-end)
+MiscSec:Toggle("Sound on Parry",false,function(v) CFG.SoundOnParry=v end)
 MiscSec:Info("Plays a click sound each time F is pressed")
 UIRefs.RhythmAutoHit = MiscSec:Toggle("Rhythm Auto-Hit", false, function(v)
     CFG.RhythmAutoHit = v
@@ -2641,11 +2584,10 @@ MiscSec:Button("Unload Syndicatus",function()
     print("[Syndicatus] Unloaded")
 end)
 
--- Anti-AFK
 AntiAFKSec:Info("Jumps every N seconds to prevent AFK kick")
 UIRefs.AntiAFK = AntiAFKSec:Toggle("Anti-AFK",false,function(v)
     CFG.AntiAFK=v
-    lastAFKPing=os.clock()  -- reset timer on toggle
+    lastAFKPing=os.clock()
     UI_Library:Notify("Anti-AFK", v and "Enabled — jumping every "..CFG.AFKInterval.."s" or "Disabled")
 end)
 UIRefs.AFKInterval = AntiAFKSec:Slider("AFK Interval",240,1,60,600,"s",function(v)
@@ -2654,7 +2596,6 @@ end)
 UIRefs.AFKInterval:Set(240)
 AntiAFKSec:Info("60s min — 600s max. Default 240s (4 min)")
 
--- Auto Respawn
 RespawnSec:Info("Respawns you automatically after death")
 UIRefs.AutoRespawn = RespawnSec:Toggle("Auto Respawn",false,function(v)
     CFG.AutoRespawn=v
@@ -2670,7 +2611,6 @@ RespawnSec:Button("Force Respawn Now",function()
     UI_Library:Notify("Respawn","Forced respawn")
 end)
 
--- Session stats
 local ParryCountLabel = SessionSec:Label("Parries this session: 0")
 SessionSec:Info("Tracks parries fired since inject")
 SessionSec:Button("Reset Counter",function()
@@ -2678,7 +2618,6 @@ SessionSec:Button("Reset Counter",function()
     pcall(function() ParryCountLabel:SetText("Parries this session: 0") end)
 end)
 
--- update counter in cycle
 local _lastCountUpdate = 0
 SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
     local now2 = os.clock()
@@ -2691,16 +2630,348 @@ end))
 local UpdatesSec = UpdatesTab:Section("UPDATES","Left")
 local SoonSec    = UpdatesTab:Section("COMING SOON","Right")
 
+-- ── v9.4.38 ──
+UpdatesSec:Divider("v9.4.38 — Peak-Tracked Hold Detection")
+UpdatesSec:Info("Fixes swap-cuts-hold-short and missed-tap-after-hold without regressing holds")
+UpdatesSec:Label("Per-note peak posDelta classifies hold vs tap at PRESS and tracks live")
+UpdatesSec:Label("hold-done: peak ≥ 80 AND posDelta ≤ 55 AND held ≥ 0.12s")
+UpdatesSec:Label("tap-done: peak < 80 AND |headY - recY| > 15")
+UpdatesSec:Label("Swap guard: refuses swap while live hold still has trail (posDelta > 55)")
+UpdatesSec:Label("Safety: 10s force release for stuck keys across song boundaries")
+
+-- ── v9.4.37 ──
+UpdatesSec:Divider("v9.4.37 — Full Revert to Hold-on-Despawn")
+UpdatesSec:Label("Restored v9.4.30 model. Early release attempts broke holds.")
+
+-- ── v9.4.36 ──
+UpdatesSec:Divider("v9.4.36 — Crisp Hold End")
+UpdatesSec:Info("Log proved: hold Head parks at recY, posDelta falls 426→0")
+UpdatesSec:Label("RELEASE hold-done when posDelta ≤ 55 after peak ≥ 80")
+UpdatesSec:Label("RELEASE tap-done when Head past receptor (no wait despawn)")
+UpdatesSec:Label("Never swap while a real hold still has trail (posDelta > 55)")
+UpdatesSec:Label("Despawn / lost-track still safety-net")
+
+-- ── v9.4.35 ──
+UpdatesSec:Divider("v9.4.35 — Hold Rollback")
+UpdatesSec:Info("v9.4.32–34 early-release logic stopped holds from holding")
+UpdatesSec:Label("Restored v9.4.30 model that actually kept the key down")
+UpdatesSec:Label("PRESS when Head near receptor | HOLD until note despawns")
+UpdatesSec:Label("No trail-gone / shrink release — those cut holds short")
+UpdatesSec:Label("Still: exclude held note from candidates, swap = release+press")
+
+-- ── v9.4.34 ──
+UpdatesSec:Divider("v9.4.34 — Early Hold Release (other-lane after pause)")
+UpdatesSec:Info("Same-timing hold+tap (multi-lane) worked; hold → pause → other-lane TAP missed")
+UpdatesSec:Label("Hold key stayed down until despawn — blocked later input on some setups")
+UpdatesSec:Info("Fix")
+UpdatesSec:Label("Release when trail shrinks to ~35% of peak (hold-shrunk) — early into the pause")
+UpdatesSec:Label("Still release at baseline (hold-trail-gone) and despawn")
+UpdatesSec:Label("lost-track: if held note stops matching, release immediately")
+UpdatesSec:Label("Other lanes were always independent keys — early release unblocks them")
+
+-- ── v9.4.33 ──
+UpdatesSec:Divider("v9.4.33 — posDelta Baseline (the real bug)")
+UpdatesSec:Info("Debug proved every release was (swap) — never trail-gone or tap-past")
+UpdatesSec:Label("Head/Tail always have ~40px posDelta layout gap even on TAPS")
+UpdatesSec:Label("Old HOLD_TAIL_MIN=8 marked EVERY note as hold → trail never 'collapsed'")
+UpdatesSec:Label("Real holds show posDelta 400–1100 then shrink back toward ~40")
+UpdatesSec:Info("Fix")
+UpdatesSec:Label("Real hold only if posDelta >= 80")
+UpdatesSec:Label("Taps (posDelta ~40) release on head-past")
+UpdatesSec:Label("Real holds release when posDelta falls back <= 55")
+UpdatesSec:Label("Never swap-interrupt a real hold while trail still active")
+UpdatesSec:Label("Ignore offscreen pooled notes (|head-rec| > 2500)")
+
+-- ── v9.4.32 ──
+UpdatesSec:Divider("v9.4.32 — Long Hold Reset")
+UpdatesSec:Info("Only LONG holds missed the next TAP; short/medium were fine")
+UpdatesSec:Label("Cause: long-hold Head parks on receptor for the whole duration")
+UpdatesSec:Label("abs(head-rec) never grows → geometric past-release never fired")
+UpdatesSec:Label("Held note re-won pressCandidate every frame → next TAP starved")
+UpdatesSec:Info("Fix")
+UpdatesSec:Label("Confirmed hold completes when Tail height/posDelta collapses (~0)")
+UpdatesSec:Label("Currently-held note is excluded from pressCandidate")
+UpdatesSec:Label("Release still runs before Press every tick")
+
+-- ── v9.4.31 ──
+UpdatesSec:Divider("v9.4.31 — Instant Release + Multi-Lane")
+UpdatesSec:Info("Problem")
+UpdatesSec:Label("After a hold finished, next TAP missed ~50% — key still held, no edge")
+UpdatesSec:Info("Fix")
+UpdatesSec:Label("RELEASE pass runs BEFORE PRESS pass every tick")
+UpdatesSec:Label("Taps: release as soon as Head is past receptor (not wait despawn)")
+UpdatesSec:Label("Holds: release when trail fully past (hold-done), else despawn")
+UpdatesSec:Label("Always keyrelease before keypress on lane swap (fresh edge)")
+UpdatesSec:Info("Simultaneous notes")
+UpdatesSec:Label("Different lanes (e.g. F+J same beat): both press same tick — independent keys")
+UpdatesSec:Label("Same lane double: nearest head wins; one press covers the window")
+
+-- ── v9.4.30 ──
+UpdatesSec:Divider("v9.4.30 — Unified Press / Despawn Release")
+UpdatesSec:Info("Debug: every note has Head+Tail, AbsoluteSize 0x0 on spawn")
+UpdatesSec:Label("Classifying hold vs tap from size was impossible on first frames")
+UpdatesSec:Label("Holds were TAP'd before Tail height ever became non-zero")
+UpdatesSec:Info("New model (no hold/tap split)")
+UpdatesSec:Label("PRESS when Head.AbsolutePosition enters receptor window")
+UpdatesSec:Label("HOLD the key while the note exists in Lanes")
+UpdatesSec:Label("RELEASE when game removes the note (despawn)")
+UpdatesSec:Label("Taps despawn fast → short press | Holds stay → real hold")
+
+-- ── v9.4.29 ──
+UpdatesSec:Divider("v9.4.29 — Live Hold Classification")
+UpdatesSec:Info("Debug proved AbsoluteSize is 0x0 on first sight of every note")
+UpdatesSec:Label("Old code locked isHold=false forever on that first 0-size frame")
+UpdatesSec:Label("Gakuran structure: NoteTemplate → Head + Tail ImageLabels")
+UpdatesSec:Info("Fix")
+UpdatesSec:Label("Re-evaluate Tail height EVERY frame (AbsoluteSize + Offset + Scale)")
+UpdatesSec:Label("Hold if TailH >= 8 OR |TailY-HeadY| >= 8 OR frameH >= 60")
+UpdatesSec:Label("Press uses Head.AbsolutePosition.Y (leading edge)")
+UpdatesSec:Label("Debug dumps only once geometry is non-zero")
+
+-- ── v9.4.28 ──
+UpdatesSec:Divider("v9.4.28 — Hold Notes Robust")
+
+-- ── v9.4.27 ──
+UpdatesSec:Divider("v9.4.27 — Hold Detection + Diagnostics")
+UpdatesSec:Info("Hypothesis")
+UpdatesSec:Label("Gakuran hold notes may not have a child named 'Tail'")
+UpdatesSec:Label("Our hasTail check failed → fell into tap branch → tapped the hold")
+UpdatesSec:Info("New detection")
+UpdatesSec:Label("Hold = has Tail child OR note frame itself is tall (>60px)")
+UpdatesSec:Label("Head Y = tail bottom (if child) OR note frame bottom (fallback)")
+UpdatesSec:Label("Release = note removed from Lanes (.Parent == nil)")
+UpdatesSec:Info("Debug prints — enable 'Debug Parry' in Combat tab")
+UpdatesSec:Label("Logs note size, children, and press events")
+UpdatesSec:Label("Help us see WHAT the hold notes actually look like in-game")
+
+-- ── v9.4.26 ──
+UpdatesSec:Divider("v9.4.26 — Hold Note Identity Tracking")
+UpdatesSec:Info("The actual actual fix (ported from lolbeans)")
+UpdatesSec:Label("HeldKeys[lane] now stores the NOTE reference, not a boolean")
+UpdatesSec:Label("Prevents re-pressing the same hold on next frame = no tap-tap-tap")
+UpdatesSec:Info("The bug in v9.4.23-25")
+UpdatesSec:Label("After release, next frame saw head still in threshold")
+UpdatesSec:Label("HeldKeys was false (just released) → PRESS fired again")
+UpdatesSec:Label("Each frame = new press+release = game registered as multiple TAPS")
+UpdatesSec:Info("Press is +15 past receptor (matches lolbeans)")
+UpdatesSec:Label("Gakuran hold-note hit zone sits slightly past the visual receptor")
+UpdatesSec:Label("Pressing centered on receptor missed the actual registration window")
+UpdatesSec:Info("Release: tail top crosses receptor + 10ms delay before clear")
+
+-- ── v9.4.25 ──
+UpdatesSec:Divider("v9.4.25 — Game-Driven Hold Release")
+UpdatesSec:Info("The actual fix")
+UpdatesSec:Label("Press on head arrival (geometry — correct)")
+UpdatesSec:Label("Release when game removes the note from Lanes")
+UpdatesSec:Label("No more guessing hold duration from tail length math")
+UpdatesSec:Info("Why previous attempts failed")
+UpdatesSec:Label("Tail-top-crossing release fired too fast for short tails")
+UpdatesSec:Label("Game registered the quick press-release as TAP → BAD rating")
+UpdatesSec:Label("The game ITSELF knows when hold is complete — removes note")
+UpdatesSec:Info("Added safety")
+UpdatesSec:Label("Head 200px past receptor → force release (stuck key protection)")
+
+-- ── v9.4.24 ──
+UpdatesSec:Divider("v9.4.24 — Held Notes Actual Fix")
+UpdatesSec:Info("Fixed v9.4.23 regression")
+UpdatesSec:Label("Used notePos.Y as head — wrong, that's the whole-frame top (= tail top)")
+UpdatesSec:Label("Actual head is at tail BOTTOM: tail.AbsolutePosition.Y + Size.Y")
+UpdatesSec:Label("Press was firing when tail top near receptor → head already past")
+UpdatesSec:Label("Release checked tail top ~immediately → instant release → tap feel")
+UpdatesSec:Info("Correct geometry")
+UpdatesSec:Label("Note frame wraps both tail (above) and head (below)")
+UpdatesSec:Label("Press when tail bottom (= head) reaches receptor")
+UpdatesSec:Label("Release when tail top reaches receptor (whole note passed)")
+
+-- ── v9.4.23 ──
+UpdatesSec:Divider("v9.4.23 — Rhythm Held Notes Fix")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Held notes now press at head arrival + release at tail-top crossing")
+UpdatesSec:Label("Was: press fired late (head 15px past receptor) → missed hit window")
+UpdatesSec:Label("Was: release math was tangled → inconsistent hold duration")
+UpdatesSec:Info("Geometry — standard DDR scroll")
+UpdatesSec:Label("notePos.Y = head (what we tap)")
+UpdatesSec:Label("tail.AbsolutePosition.Y = tail TOP (last pixel to cross)")
+UpdatesSec:Label("tail.AbsoluteSize.Y = hold length × scroll speed")
+UpdatesSec:Info("Press when head at receptor | Release when tail top crosses")
+
+-- ── v9.4.22 ──
+UpdatesSec:Divider("v9.4.22 — Matcha Init Fix")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("AnimationTracker.new was called with wrong args since forever")
+UpdatesSec:Label("pcall(fn, AnimationTracker, IgnoreIds) → pcall(fn, IgnoreIds)")
+UpdatesSec:Label("IgnoreIds was being set to the class table instead of our list")
+UpdatesSec:Label("Ignore filter now actually works — fewer unknown anims processed")
+UpdatesSec:Info("Not a fix for Matcha:63 LocalPlayer error — that's external")
+UpdatesSec:Label("Our matcha has zero LocalPlayer code at any line")
+UpdatesSec:Label("Check autoexec folder for stray scripts")
+
+-- ── v9.4.21 ──
+UpdatesSec:Divider("v9.4.21 — Killed firesignal Spam")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Matcha:684 / Matcha:677 'index nil with Begin/End' spam")
+UpdatesSec:Label("firesignal fake InputObject was choking matcha's UIS listener")
+UpdatesSec:Label("Removed fireUISKey helper + all three call sites")
+UpdatesSec:Info("Back to pure VIM input")
+UpdatesSec:Label("firesignal path was marginal gain, not worth breaking matcha")
+UpdatesSec:Label("All other fixes intact — event detection, StunToken, catchalls")
+
+-- ── v9.4.20 ──
+UpdatesSec:Divider("v9.4.20 — Self-M1 Regression Fix")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("v9.4.19 self-M1 lockout permanently stunned active attackers")
+UpdatesSec:Label("Every M1 you threw extended lockout by 0.5s → AP never fired")
+UpdatesSec:Label("Removed the GameConfig[animId] markStunned call entirely")
+UpdatesSec:Info("Kept the good v9.4.19 ports")
+UpdatesSec:Label("Event-driven LocalTracker.AnimationAdded — zero latency parry detection")
+UpdatesSec:Label("StunToken auto-recovery")
+UpdatesSec:Label("Local health exit in main loop")
+UpdatesSec:Info("Added safety")
+UpdatesSec:Label("HB now clears LocalStunned if no stun anim actually playing")
+UpdatesSec:Label("Prevents stuck-stunned if StunToken timer glitches")
+
+-- ── v9.4.19 ──
+UpdatesSec:Divider("v9.4.19 — Lolbeans Source Ports")
+UpdatesSec:Info("Ported from lolbeans67 public source")
+UpdatesSec:Label("Separate LocalTracker — event-driven anim detection (0ms vs 16ms)")
+UpdatesSec:Label("Self-M1 protection — AP won't fire during our own attack commits")
+UpdatesSec:Label("StunToken pattern — clean multi-hit stun recovery")
+UpdatesSec:Label("Local health exit — main loop no-ops when we're dead")
+UpdatesSec:Info("The self-M1 fix is huge")
+UpdatesSec:Label("Was: AP tried to parry during your M1 → attack cancelled → input fight")
+UpdatesSec:Label("Now: AP sees our own M1 anim → marks stunned → leaves input alone")
+UpdatesSec:Label("This is what was causing the \"inputs fighting each other\" feel")
+UpdatesSec:Info("HB local scan now backup only — AnimationAdded is primary")
+
+-- ── v9.4.18 ──
+UpdatesSec:Divider("v9.4.18 — Dual-Fire Input")
+UpdatesSec:Info("Added")
+UpdatesSec:Label("firesignal path alongside VIM for F press/release")
+UpdatesSec:Label("Fires UIS.InputBegan directly where executor supports it")
+UpdatesSec:Label("5-10% latency improvement on compatible executors")
+UpdatesSec:Info("Architectural reality")
+UpdatesSec:Label("Private scripts using game offsets bypass VIM entirely")
+UpdatesSec:Label("That requires paid offset access or game RE")
+UpdatesSec:Label("Open-source AP can't fully match that feel")
+UpdatesSec:Info("What else closes the gap: Auto-R, live timings, Heavy Ready")
+
+-- ── v9.4.17 ──
+UpdatesSec:Divider("v9.4.17 — Resolution Catchall")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Failed parries now release F immediately — AP ready for next hit")
+UpdatesSec:Label("Counter-parried mid-swing — same instant release")
+UpdatesSec:Label("Any state-to-IDLE transition triggers release")
+UpdatesSec:Info("Covered scenarios")
+UpdatesSec:Label("Parry succeeded (v9.4.16)")
+UpdatesSec:Label("Got stunned/hit (v9.4.16)")
+UpdatesSec:Label("ParryFailed anim played (new)")
+UpdatesSec:Label("Counter-parried anim played (new)")
+UpdatesSec:Label("Deadline reached (always)")
+UpdatesSec:Info("INPUT_PENDING still holds F — that's \"waiting for registration\"")
+
+-- ── v9.4.16 ──
+UpdatesSec:Divider("v9.4.16 — Crispy Release")
+UpdatesSec:Info("Changed")
+UpdatesSec:Label("F releases on parry success — walkspeed back in ~80ms vs 270ms")
+UpdatesSec:Label("F releases if we get stunned — no visible lock-up")
+UpdatesSec:Info("Why movement felt interrupted")
+UpdatesSec:Label("Not VIM — the game slows walkspeed while F is held (blocking)")
+UpdatesSec:Label("We were holding F 170-220ms past when parry already registered")
+UpdatesSec:Label("Now we release the moment PARRYING state is detected")
+UpdatesSec:Info("Net effect")
+UpdatesSec:Label("Snappier post-parry movement, less drag during combos")
+UpdatesSec:Label("AP timing + success rate unchanged — only hold duration shortened")
+
+-- ── v9.4.15 ──
+UpdatesSec:Divider("v9.4.15 — Smart Range Gate")
+UpdatesSec:Info("Changed")
+UpdatesSec:Label("Default AP Range 14 → 11 (tight, legit-looking)")
+UpdatesSec:Label("Added velocity-aware predictive gate — fires on real threats only")
+UpdatesSec:Info("How the smart gate works")
+UpdatesSec:Label("In reach (dist <= range) → fire normally")
+UpdatesSec:Label("Out of reach + closing fast + will reach in 0.3s → fire (dash-in)")
+UpdatesSec:Label("Out of reach + stationary or slow → skip (not a real threat)")
+UpdatesSec:Info("Why it matters")
+UpdatesSec:Label("Firing from 14 studs on stationary targets reads as cheat")
+UpdatesSec:Label("Smart gate catches dash-ins without the sus static-range tell")
+
+-- ── v9.4.14 ──
+UpdatesSec:Divider("v9.4.14 — Range + Phantom F Fix")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("11-stud hits unparried — default AP Range 10 → 14 studs")
+UpdatesSec:Label("Phantom F held after target retreats — now releases immediately")
+UpdatesSec:Label("Covers reach of nearly all FFTM M1s (10-14 stud typical)")
+UpdatesSec:Info("Early release triggers")
+UpdatesSec:Label("1. Target despawned")
+UpdatesSec:Label("2. Target died (health <= 0)")
+UpdatesSec:Label("3. Target left AP range (new in v9.4.14)")
+UpdatesSec:Info("2-stud tolerance on range check — no flicker at boundary")
+
+-- ── v9.4.13 ──
+UpdatesSec:Divider("v9.4.13 — Input Gating")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Physical keys no longer leak into game when menu is visible")
+UpdatesSec:Label("WASD/F/etc blocked while menu is up — click freely")
+UpdatesSec:Label("Game input restored automatically on menu hide (RightShift)")
+UpdatesSec:Info("Why it mattered")
+UpdatesSec:Label("Your real F presses were fighting AP's synthetic F")
+UpdatesSec:Label("WASD leaking caused character drift during menu browse")
+UpdatesSec:Label("AP keys bypass gating via VirtualInputManager — zero impact to AP")
+UpdatesSec:Info("Hooks")
+UpdatesSec:Label("PlayerModule controls disabled/enabled on menu toggle")
+UpdatesSec:Label("setrobloxinput follows menu state")
+UpdatesSec:Label("CharacterAdded re-applies state after respawn")
+UpdatesSec:Label("Cleanup always restores input (never leave user stuck)")
+
+-- ── v9.4.12 ──
+UpdatesSec:Divider("v9.4.12 — Faster Detection + Legacy Cut")
+UpdatesSec:Info("Faster")
+UpdatesSec:Label("cycleTargets now 10Hz (was 2Hz) — new enemies in 100ms")
+UpdatesSec:Label("Target label refresh also 10Hz, smoother updates")
+UpdatesSec:Info("Removed")
+UpdatesSec:Label("[G] Gakuran .lua config support — stripped entirely")
+UpdatesSec:Label("[L] Olympus/ legacy folder enumeration — stripped")
+UpdatesSec:Label("loadProfile: JSON only now, no loadstring path")
+UpdatesSec:Info("Profiles tab is clean — only your Syndicatus/ configs show")
+
+-- ── v9.4.11 ──
+UpdatesSec:Divider("v9.4.11 — Dead Target Fix")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Jitter AP — F no longer fires when target is dead")
+UpdatesSec:Label("Live health check in main loop (was 2Hz cycle, now per-frame)")
+UpdatesSec:Label("Early F release when fired-upon target dies mid-attack")
+UpdatesSec:Info("Why it happened")
+UpdatesSec:Label("cycleTargets ran 2Hz — dead targets stayed in list 500ms")
+UpdatesSec:Label("Death ragdoll made TimePosition bounce — fake loop re-arms")
+UpdatesSec:Label("F stayed held into corpse while third party caved us")
+UpdatesSec:Info("regData now stores Target ref for post-fire death validation")
+
+-- ── v9.4.10 ──
+UpdatesSec:Divider("v9.4.10 — Edge-Trigger Fix")
+UpdatesSec:Info("Fixed")
+UpdatesSec:Label("Mid-combo parry drops — F now releases before re-press")
+UpdatesSec:Label("Each attack gets its own fresh input event (edge-triggered games)")
+UpdatesSec:Info("Why this mattered")
+UpdatesSec:Label("Fast M1 chains overlapped ParryHold (0.27s)")
+UpdatesSec:Label("Held F = block, not fresh parry — mid-combo M1s hit unparried")
+UpdatesSec:Label("Fix forces release+press so game sees distinct parry attempts")
+UpdatesSec:Info("Wrestling, MuayThai, Striker (B) all benefit most")
+
+-- ── v9.4.9 ──
+UpdatesSec:Divider("v9.4.9 — Comment Pass")
+UpdatesSec:Info("Cleaned")
+UpdatesSec:Label("Stripped version-tag comments throughout source")
+UpdatesSec:Label("Header reduced to identity + Updates-tab pointer")
+UpdatesSec:Label("BG image URL points to syndicatusAP repo")
+UpdatesSec:Info("No behavioral changes — all AP logic preserved")
+
 -- ── v9.4.8 ──
 UpdatesSec:Divider("v9.4.8 — Rebrand")
 UpdatesSec:Info("Changed")
 UpdatesSec:Label("Olympus → Syndicatus (title, notifies, print tags, identifiers)")
-UpdatesSec:Label("_G._SyndicatusAP (legacy _G._OlympusAP cleaned on upgrade)")
+UpdatesSec:Label("_G.__SyndicatusAP (legacy _G.__OlympusAP cleaned on upgrade)")
 UpdatesSec:Label("Profiles save to Syndicatus/ folder")
 UpdatesSec:Label("Share format tag updated — importer still accepts legacy tag")
-UpdatesSec:Info("Backward compat")
-UpdatesSec:Label("Legacy Olympus/ profiles show up with [L] prefix")
-UpdatesSec:Label("Re-save them under a clean name when ready")
 
 -- ── v9.4.7 ──
 UpdatesSec:Divider("v9.4.7 — Strip Pass")
@@ -2821,8 +3092,7 @@ SoonSec:Divider("Credit")
 SoonSec:Info("Made By Fgonzxlez")
 
 -- INS UI drives the AP toggle via the keybind pill (Toggle mode).
--- No custom InputBegan needed for arming — the library handles it.
--- RightShift still toggles menu visibility if the lib doesn't already.
+-- RightShift toggles menu visibility; Z/B drive Shadow Step/Crit when enabled.
 local UIS = game:GetService("UserInputService")
 SyndicatusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
     if not SyndicatusState.Alive then return end
@@ -2832,6 +3102,7 @@ SyndicatusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
             menuOpen = not menuOpen
             menuVisible = not menuVisible
             syncMenuPerformance()
+            setGameInputEnabled(not menuVisible)  -- menu visible → block game input
         elseif CFG.ShadowStep and inp.KeyCode == Enum.KeyCode.Z then
             task.spawn(doShadowSequence)
         elseif CFG.ShadowCrit and inp.KeyCode == Enum.KeyCode.B then
@@ -2842,7 +3113,8 @@ end))
 
 refreshDrop()
 setMenuInput(false)
-pcall(function() setrobloxinput(true) end)
+-- Initial input state matches initial menu visibility (menu visible on inject = block game input)
+setGameInputEnabled(not menuVisible)
 
 pcall(function() SyndicatusState.UI_Window = UI_Window end)
 
@@ -2850,8 +3122,8 @@ pcall(function() SyndicatusState.UI_Window = UI_Window end)
 -- stacking multiple delayed reapplies caused drag frame-stutter.
 applyMenuBackground()
 applyDarkTheme()
-syncMenuPerformance()  -- initial perf state matches initial menu visibility
+syncMenuPerformance()
 task.defer(function() applyMenuBackground() applyDarkTheme() end)
 task.delay(1.0, function() applyMenuBackground() applyDarkTheme() end)
-UI_Library:Notify("Syndicatus","v9.4.8 | Rebranded from Olympus")
-print("[Syndicatus v9.4.8] Rebrand pass | legacy _G key + Olympus/ profile folder still readable")
+UI_Library:Notify("Syndicatus","v9.4.40 | Taps = lolbeans 50ms press; holds unchanged; +awakened IDs")
+print("[Syndicatus v9.4.40] TAP path ported from lolbeans (press+0.05+release) | holds keep peak/hold-done")
