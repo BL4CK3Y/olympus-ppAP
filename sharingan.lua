@@ -1,177 +1,273 @@
 
--- =============================================
--- Syndicatus Auto Parry — v9.4.40
--- AP core: open-source registry + continuous window (lolbeans style)
--- Full version history lives in the Updates tab in-UI.
--- =============================================
-
--- Cleanup previous inject — handles both current and legacy _G keys
 pcall(function()
-    if _G.__SyndicatusAP and _G.__SyndicatusAP.Cleanup then
-        _G.__SyndicatusAP:Cleanup()
-    end
-    if _G.__OlympusAP and _G.__OlympusAP.Cleanup then
-        _G.__OlympusAP:Cleanup()
-        _G.__OlympusAP = nil
+    if _G.__Lolbeans67APNoCrash and _G.__Lolbeans67APNoCrash.Cleanup then
+        _G.__Lolbeans67APNoCrash:Cleanup()
     end
 end)
 
-local SyndicatusState = {
+local NoCrashState = {
     Alive = true,
     Connections = {},
+    Drawings = {},
+    HealthEntries = {},
+    OpponentHpEnabled = false,
+    PersonalHpEnabled = false,
+    TargetMarkerEnabled = true,
+    CombatEspEnabled = false,   -- name / range box (off by default — was the noisy ESP)
+    AnimDebugEspEnabled = false, -- full anim ID / timing dump (debug only)
+    HpViewRange = 75,
+    LastOverlayUpdate = 0,
 }
-_G.__SyndicatusAP = SyndicatusState
+_G.__Lolbeans67APNoCrash = NoCrashState
 
-function SyndicatusState:AddConnection(c)
-    if c then table.insert(self.Connections, c) end
-    return c
+function NoCrashState:AddConnection(connection)
+    if connection then
+        table.insert(self.Connections, connection)
+    end
+    return connection
 end
 
-function SyndicatusState:Cleanup()
+function NoCrashState:AddDrawing(kind)
+    local ok, drawing = pcall(function()
+        return Drawing.new(kind)
+    end)
+    if ok and drawing then
+        table.insert(self.Drawings, drawing)
+        return drawing
+    end
+end
+
+function NoCrashState:Cleanup()
     self.Alive = false
-    if self.Connections then
-        for _, c in ipairs(self.Connections) do
-            pcall(function() c:Disconnect() end)
-        end
-        table.clear(self.Connections)
+    if self.ClearEspTrackers then
+        pcall(self.ClearEspTrackers)
     end
-    pcall(function()
-        if self.UI_Window and self.UI_Window.Destroy then
-            self.UI_Window:Destroy()
-        end
-    end)
-    -- Restore game input before unloading — never leave the user controlless
-    pcall(function()
-        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
-        if playerScripts then
-            local playerModule = playerScripts:FindFirstChild("PlayerModule")
-            if playerModule then
-                local module = require(playerModule)
-                module:GetControls():Enable()
-            end
-        end
-    end)
-    pcall(function() setrobloxinput(true) end)
-    print("[Syndicatus] Cleaned up previous session")
+    for _, connection in ipairs(self.Connections or {}) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(self.Connections or {})
+    for _, drawing in ipairs(self.Drawings or {}) do
+        pcall(function() drawing:Remove() end)
+    end
+    table.clear(self.Drawings or {})
 end
 
--- Services
-local RunService  = game:GetService("RunService")
+local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
-local PlayersSvc  = game:GetService("Players")
-local StatsSvc    = game:GetService("Stats")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
 
-local LocalPlayer = PlayersSvc.LocalPlayer
-if not LocalPlayer then LocalPlayer = PlayersSvc.PlayerAdded:Wait() end
+local UIS = game:GetService("UserInputService")
+local SelectedFolder = nil
+local CycleKeybind = Enum.KeyCode.X
 
--- Forward-declare so BoxingM2 ParryFunction closure captures the local slot
-local BlockStart, BlockEnd, Dodge
+local ESP_Utility = loadstring(game:HttpGet("https://raw.githubusercontent.com/artxficial/matchastuff/main/esp_utility.lua"))() or ESP_Utility
+local AnimationTrackerClass = loadstring(game:HttpGet("https://raw.githubusercontent.com/artxficial/matchastuff/main/animationtracker.lua"))() or AnimationTracker
 
--- ── Utilities ──
-pcall(function()
-    loadstring(game:HttpGet(
-        "https://raw.githubusercontent.com/artxficial/matchastuff/main/animationtracker.lua"
-    ))()
-end)
+-- Harden AnimationTracker: library prints "Failed to resolve Animator." and returns nil
+-- when Character/Animator.Address is missing (common mid-stream / Matcha lag).
+-- Wrap Update so we never spam console and never leave callers with nil.
+do
+    local rawUpdate = AnimationTrackerClass and AnimationTrackerClass.Update
+    if type(rawUpdate) == "function" then
+        local function instanceAddress(inst)
+            if not inst then return nil end
+            -- Instances are userdata — never rawget them
+            local a
+            local okA, vA = pcall(function() return inst.Address end)
+            if okA and type(vA) == "number" and vA ~= 0 then return vA end
+            if type(getaddress) == "function" then
+                local ok, v = pcall(getaddress, inst)
+                if ok and type(v) == "number" and v ~= 0 then return v end
+            end
+            if type(get_address) == "function" then
+                local ok, v = pcall(get_address, inst)
+                if ok and type(v) == "number" and v ~= 0 then return v end
+            end
+            return nil
+        end
 
-pcall(function()
-    loadstring(game:HttpGet(
-        "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"
-    ))()
-end)
+        function AnimationTrackerClass:Update(character)
+            if not character or character.Parent == nil then return {} end
+            local hum = character:FindFirstChildOfClass("Humanoid")
+                or character:FindFirstChildWhichIsA("Humanoid")
+            if not hum or hum.Health <= 0 then return {} end
+            local animator = hum:FindFirstChildOfClass("Animator")
+                or hum:FindFirstChildWhichIsA("Animator")
+            if not animator then return {} end
 
-local UI_Library = rawget(_G, "INSui") or (INSui)
-if UI_Library and UI_Library.SetAccent then
-    pcall(function() UI_Library:SetAccent(Color3.fromRGB(210, 40, 40)) end)
-end
-
--- Full IgnoreIds from original AP (non-attack anims)
-local IgnoreIds = {
-    73766443218740,111699625251889,85823794654077,99661732639863,106268941365574,109816855387997,122561749929324,129805948180599,
-    90752347516770,135133599113049,132695091086148,137015026151472,114511731321756,100794890036133,109303037515668,117293898907979,
-    74690341409113,73090768467054,72284079162560,89016181362524,76945839486275,101161965631044,128307941333158,85931837451298,
-    91352556581859,77911299793653,129335968179665,122384188141033,132695766056641,113331696487725,124220338099067,99799500309776,
-    108636808436488,90015977935891,87932588807124,132477488202815,102982320608759,109278619250401,79971841883936,97783129267001,
-    72822821848529,79974955602012,77798715679680,85845666927963,108862846290180,108045962864902,93184693099565,120399899079666,
-    99958962160522,93221784050620,70767328707698,
-}
-
--- Local state anims (block AP while we are stunned / already parrying)
-local ParriedAnimation = {
-    ["rbxassetid://100773926241456"]=true, ["rbxassetid://102823909334302"]=true,
-    ["rbxassetid://96304721384743"]=true,  ["rbxassetid://82979105739696"]=true,
-    ["rbxassetid://96600699015093"]=true,  ["rbxassetid://138519505081692"]=true,
-}
-local StunnedAnimation = {
-    ["rbxassetid://122541287927198"]=true, ["rbxassetid://83600639547203"]=true,
-    ["rbxassetid://80309578200579"]=true,  ["rbxassetid://92787945841620"]=true,
-    ["rbxassetid://108045962864902"]=true, ["rbxassetid://104407197874289"]=true,
-}
-local ParryingAnimation = {
-    ["rbxassetid://118147060185189"]=true, ["rbxassetid://80135556847061"]=true,
-    ["rbxassetid://88718564310179"]=true,
-}
-local ParryFailedAnimation = {
-    ["rbxassetid://4210597123"]=true,
-}
-
-local function animSetHas(set, id)
-    if not id then return false end
-    id = tostring(id)
-    if set[id] then return true end
-    if not id:find("rbxassetid://", 1, true) then
-        return set["rbxassetid://" .. id] == true
+            -- Silence library's "Failed to resolve Animator." (Address lag / missing)
+            local oldPrint = print
+            print = function(msg, ...)
+                if type(msg) == "string" and string.find(msg, "Failed to resolve Animator", 1, true) then
+                    return
+                end
+                return oldPrint(msg, ...)
+            end
+            local ok, result = pcall(rawUpdate, self, character)
+            print = oldPrint
+            if not ok then return {} end
+            return result or {}
+        end
     end
-    return false
 end
 
--- ── Animation Database (FFTM ids) ──
+local UI_Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/artxficial/INS-ui/main/uilib.min.lua"))() or INSui
+
+-- Red accent (Syndicatus-style)
+pcall(function()
+    if UI_Library and UI_Library.SetAccent then
+        UI_Library:SetAccent(Color3.fromRGB(210, 40, 40))
+    end
+end)
+
+local AnimationsLoggedCache = {}
+local AnimationsLoggedOrder = {}
+
+
+-- ==========================================
+-- Game Configuration
+-- ==========================================
+
+local GameName = "Gakuran"
+
 local GameConfig = {
     ["KarateAnims"] = {
-        ["rbxassetid://136346659171696"] = { DisplayName = "1stM1", ReactionTime = 0.15 },
-        ["rbxassetid://137514920199894"] = { DisplayName = "2ndM1", ReactionTime = 0.15 },
-        ["rbxassetid://72779501873271"]  = { DisplayName = "3rdM1", ReactionTime = 0.15 },
-        ["rbxassetid://127487637547915"] = { DisplayName = "4thM1", ReactionTime = 0.15 },
-        ["rbxassetid://96466099895892"]  = { DisplayName = "M2",    ReactionTime = 0.3 },
-        ["rbxassetid://116278224437295"] = { DisplayName = "M2",    ReactionTime = 0.1 },
+        ["rbxassetid://136346659171696"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://137514920199894"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://72779501873271"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://127487637547915"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://116278224437295"] = { DisplayName = "M2", ReactionTime = 0.3 },
+        ["rbxassetid://96466099895892"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.3,
+        },
+    },
+    ["AliAnims"] = {
+        ["rbxassetid://103211517133243"] = {
+            DisplayName = "1stM1",
+            ["ReactionTime"] = 0.12,
+        },
+        ["rbxassetid://88548871262625"] = {
+            DisplayName = "2ndM1",
+            ["ReactionTime"] = 0.17,
+        },
+        ["rbxassetid://104356393941647"] = {
+            DisplayName = "3rdM1",
+            ["ReactionTime"] = 0.21,
+        },
+        ["rbxassetid://109925400698635"] = {
+            DisplayName = "4thM1",
+            ["ReactionTime"] = 0.11,
+        },
+        ["rbxassetid://92831721340116"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.34,
+        },
+        ["rbxassetid://81488798354194"] = {
+            DisplayName = "M2Right",
+            ReactionTime = 0.34,
+        },
     },
     ["BasicAnims"] = {
-        ["rbxassetid://100661797632126"] = { DisplayName = "1stM1" },
-        ["rbxassetid://117315538657801"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://83771012317903"]  = { DisplayName = "3rdM1" },
-        ["rbxassetid://129031831390386"] = { DisplayName = "4thM1" },
-        ["rbxassetid://80331331149375"]  = { DisplayName = "M2", ReactionTime = 0.3 },
+        ["rbxassetid://100661797632126"] = {
+            DisplayName = "1stM1"
+        },
+        ["rbxassetid://117315538657801"] = {
+            DisplayName = "2ndM1"
+        },
+        ["rbxassetid://83771012317903"] = {
+            DisplayName = "3rdM1"
+        },
+        ["rbxassetid://129031831390386"] = {
+            DisplayName = "4thM1"
+        },
+        ["rbxassetid://80331331149375"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.3,
+        },
         ["M1Time"] = 0.14,
     },
     ["WrestlingAnims"] = {
-        ["rbxassetid://124808151650835"] = { DisplayName = "1stM1" },
-        ["rbxassetid://79996486219181"]  = { DisplayName = "2ndM1" },
-        ["rbxassetid://115207134396914"] = { DisplayName = "3rdM1" },
-        ["rbxassetid://74020075116139"]  = { DisplayName = "4thM1" },
-        ["rbxassetid://91419261625463"]  = { DisplayName = "M2", ReactionTime = 0.3 },
-        ["rbxassetid://135984725924501"] = { DisplayName = "M2EHit" },
-        ["rbxassetid://99774162066012"]  = { DisplayName = "M2Success" },
+        ["rbxassetid://74020075116139"] = {
+            DisplayName = "4thM1",
+        },
+        ["rbxassetid://91419261625463"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.3,
+        },
+        ["rbxassetid://124808151650835"] = {
+            DisplayName = "1stM1",
+        },
+        ["rbxassetid://79996486219181"] = {
+            DisplayName = "2ndM1",
+        },
+        ["rbxassetid://115207134396914"] = {
+            DisplayName = "3rdM1",
+        },
         ["M1Time"] = 0.15,
+
     },
     ["MuayThaiAnims"] = {
-        ["rbxassetid://110917888708142"] = { DisplayName = "1stM1", ParryTime = 0.08 },
-        ["rbxassetid://136830198456192"] = { DisplayName = "2ndM1", ParryTime = 0.08 },
-        ["rbxassetid://103717575086418"] = { DisplayName = "3rdM1", ParryTime = 0.08 },
-        ["rbxassetid://90445272780399"]  = { DisplayName = "4thM1", ParryTime = 0.08 },
-        ["rbxassetid://74462376752922"]  = { DisplayName = "M2", ReactionTime = 0.3 },
-        ["rbxassetid://137299369381761"] = { DisplayName = "M2", ReactionTime = 0.1 },
-        ["M1Time"] = 0.1,
+        ["rbxassetid://137299369381761"] = { DisplayName = "M2", ReactionTime = 0.3 },
+        ["rbxassetid://74462376752922"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.3,
+        },
+        ["rbxassetid://90445272780399"] = {
+            DisplayName = "4thM1",
+            ParryTime = 0.08,
+        },
+        ["rbxassetid://103717575086418"] = {
+            DisplayName = "3rdM1",
+            ParryTime = 0.08,
+        },
+        ["rbxassetid://136830198456192"] = {
+            DisplayName = "2ndM1",
+            ParryTime = 0.08,
+            
+        },
+        ["rbxassetid://110917888708142"] = {
+            DisplayName = "1stM1",
+            ParryTime = 0.08,
+        },
+        ["M1Time"] = 0.1,        
     },
     ["BoxingAnims"] = {
-        ["rbxassetid://132913269853139"] = { DisplayName = "1stM1", ReactionTime = 0.17 },
-        ["rbxassetid://76033376851583"]  = { DisplayName = "2ndM1", ReactionTime = 0.17 },
-        ["rbxassetid://126463147281440"] = { DisplayName = "3rdM1", ReactionTime = 0.17 },
-        ["rbxassetid://75666664304014"]  = { DisplayName = "4thM1", ReactionTime = 0.17 },
+        ["rbxassetid://132913269853139"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.17,
+        },
+        ["rbxassetid://76033376851583"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.17,
+        },
+        ["rbxassetid://126463147281440"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.17,
+            
+        },
+        ["rbxassetid://75666664304014"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.17,
+        },
         ["rbxassetid://128921678079615"] = {
             DisplayName = "M2",
             ReactionTime = 0.40,
             BoxingM2 = true,
-            -- Custom sequence: wait → block → dodge (original behavior)
+            -- Syndicatus sequence: wait → block hold → optional dodge
             ParryFunction = function(data)
                 if not CFG.AutoBoxingM2 then return end
                 if data.RegistryData and data.RegistryData.Processed then return end
@@ -181,878 +277,1596 @@ local GameConfig = {
                     BlockStart(os.clock(), 0.50)
                     if CFG.AutoDodge then
                         task.wait(0.30)
-                        Dodge(true)
+                        Dodge(true) -- force: part of Boxing M2 sequence
                     end
                 end)
             end,
         },
     },
-    ["HakariOtherAnims"] = {
-        ["rbxassetid://117925051452801"] = { DisplayName = "1stM1" },
-        ["rbxassetid://122040023429227"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://126306184412990"] = { DisplayName = "3rdM1" },
-        ["rbxassetid://85805632651129"]  = { DisplayName = "4thM1" },
-        ["rbxassetid://106589382211868"] = { DisplayName = "MomentumM2" },
-        ["rbxassetid://127394334888645"] = { DisplayName = "M2" },
-        -- Alternate IDs from lolbeans67
-        ["rbxassetid://126612786608030"] = { DisplayName = "1stM1" },
-        ["rbxassetid://113719263885794"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://136305578634960"] = { DisplayName = "3rdM1" },
-        ["rbxassetid://89039586375625"]  = { DisplayName = "4thM1" },
-        ["rbxassetid://101619248052969"] = { DisplayName = "M2", ReactionTime = 0.3 },
+    ["HakariAnims"] = {
+        ["rbxassetid://82855179231529"] = {
+            DisplayName = "MomentumM2"
+        },
+        ["rbxassetid://123215666398014"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://100249628136368"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.17,
+        },
+        ["rbxassetid://101160496635774"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://76458394174684"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.21,
+        },
+        ["rbxassetid://78127273702521"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.19,
+        },
     },
     ["CapoeiraAnims"] = {
-        ["rbxassetid://91953931348325"]  = { DisplayName = "1stM1", ReactionTime = 0.15 },
-        ["rbxassetid://127465095270110"] = { DisplayName = "2ndM1", ReactionTime = 0.22 },
-        ["rbxassetid://79017113400162"]  = { DisplayName = "3rdM1", ReactionTime = 0.16 },
-        ["rbxassetid://98872276178039"]  = { DisplayName = "4thM1", ReactionTime = 0.16 },
-        ["rbxassetid://101740002500802"] = { DisplayName = "M2",    ReactionTime = 0.32 },
+        ["rbxassetid://91953931348325"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.15,
+        },
+        ["rbxassetid://127465095270110"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.22,
+        },
+        ["rbxassetid://79017113400162"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.16,
+        },
+        ["rbxassetid://98872276178039"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.16,
+        },
+        ["rbxassetid://101740002500802"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.32,
+        }
     },
     ["SluggerAnims"] = {
-        ["rbxassetid://78852386182257"]  = { DisplayName = "1stM1", ReactionTime = 0.24 },
-        ["rbxassetid://89706363973188"]  = { DisplayName = "2ndM1", ReactionTime = 0.22 },
-        ["rbxassetid://127941398150401"] = { DisplayName = "3rdM1", ReactionTime = 0.22 },
-        ["rbxassetid://97696355281722"]  = { DisplayName = "4thM1", ReactionTime = 0.19 },
-        ["rbxassetid://86882821333237"]  = { DisplayName = "M2",    ReactionTime = 0.65 },
-    },
-    ["KureAnims"] = {
-        ["rbxassetid://89598700542051"]  = { DisplayName = "1stM1", ReactionTime = 0.16 },
-        ["rbxassetid://84100769626105"]  = { DisplayName = "2ndM1", ReactionTime = 0.16 },
-        ["rbxassetid://75725487794798"]  = { DisplayName = "3rdM1", ReactionTime = 0.16 },
-        ["rbxassetid://103586798765773"] = { DisplayName = "4thM1", ReactionTime = 0.16 },
-        ["rbxassetid://128246407698779"] = { DisplayName = "M2" },
-        ["rbxassetid://104060526539640"] = { DisplayName = "M2EHit" },
-    },
-    ["AliAnims"] = {
-        ["rbxassetid://103211517133243"] = { DisplayName = "1stM1",   ReactionTime = 0.12 },
-        ["rbxassetid://88548871262625"]  = { DisplayName = "2ndM1",   ReactionTime = 0.17 },
-        ["rbxassetid://104356393941647"] = { DisplayName = "3rdM1",   ReactionTime = 0.21 },
-        ["rbxassetid://109925400698635"] = { DisplayName = "4thM1",   ReactionTime = 0.11 },
-        ["rbxassetid://92831721340116"]  = { DisplayName = "M2",      ReactionTime = 0.3 },
-        ["rbxassetid://81488798354194"]  = { DisplayName = "M2Right", ReactionTime = 0.3 },
-    },
-    ["HakariAnims"] = {
-        ["rbxassetid://123215666398014"] = { DisplayName = "1stM1", ReactionTime = 0.15 },
-        ["rbxassetid://100249628136368"] = { DisplayName = "2ndM1", ReactionTime = 0.17 },
-        ["rbxassetid://101160496635774"] = { DisplayName = "3rdM1", ReactionTime = 0.15 },
-        ["rbxassetid://76458394174684"]  = { DisplayName = "4thM1", ReactionTime = 0.21 },
-        ["rbxassetid://78127273702521"]  = { DisplayName = "M2",    ReactionTime = 0.19 },
-        ["rbxassetid://137954350192006"] = { DisplayName = "MomentumM2" },
-        ["rbxassetid://82855179231529"]  = { DisplayName = "MomentumM2", ReactionTime = 0.15 },
-    },
-    ["WingChunAnims"] = {
-        ["rbxassetid://94976161225956"]  = { DisplayName = "1stM1", ReactionTime = 0.16 },
-        ["rbxassetid://130903067566077"] = { DisplayName = "2ndM1", ReactionTime = 0.16 },
-        ["rbxassetid://139503477666199"] = { DisplayName = "3rdM1", ReactionTime = 0.16 },
-        ["rbxassetid://135699957281468"] = { DisplayName = "4thM1", ReactionTime = 0.52 },
-        ["rbxassetid://125237241325107"] = { DisplayName = "M2",    ReactionTime = 0.06, ForceParry = true },
-        ["rbxassetid://140240091451745"] = { DisplayName = "M2Success" },
-        ["rbxassetid://138270482936731"] = { DisplayName = "M2EHit" },
+        ["rbxassetid://78852386182257"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.24,
+        },
+        ["rbxassetid://89706363973188"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.22,
+        },
+        ["rbxassetid://127941398150401"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.22
+        },
+        ["rbxassetid://97696355281722"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.19,
+        },
+        ["rbxassetid://86882821333237"] = {
+            DisplayName = "M2",
+            ReactionTime = 0.65,
+        }
     },
     ["StrikerAnims"] = {
-        -- Set A (older)
-        ["rbxassetid://79224782278508"]  = { DisplayName = "1stM1 (A)" },
-        ["rbxassetid://74337052553355"]  = { DisplayName = "2ndM1 (A)" },
-        ["rbxassetid://121264916189386"] = { DisplayName = "3rdM1 (A)" },
-        ["rbxassetid://125556631043249"] = { DisplayName = "4thM1 (A)" },
-        -- Legacy M2 / feint
-        ["rbxassetid://128600830397859"] = { DisplayName = "StrikerFeint", ReactionTime = 0.31 },
-        -- Set B (alternate)
-        ["rbxassetid://132840225082238"] = { DisplayName = "1stM1 (B)" },
-        ["rbxassetid://88761422474765"]  = { DisplayName = "2ndM1 (B)" },
-        ["rbxassetid://98462236639320"]  = { DisplayName = "3rdM1 (B)" },
-        ["rbxassetid://122451562066756"] = { DisplayName = "4thM1 (B)" },
-        -- Current set (faster chain)
+        ["rbxassetid://79224782278508"] = {
+            DisplayName = "1stM1"
+        },
+        ["rbxassetid://74337052553355"] = {
+            DisplayName = "2ndM1"
+        },
+        ["rbxassetid://121264916189386"] = {
+            DisplayName = "3rdM1"
+        },
+        ["rbxassetid://125556631043249"] = {
+            DisplayName = "4thM1"
+        },
+        ["rbxassetid://128600830397859"] = {
+            DisplayName = "M2"
+        },
+        ["rbxassetid://132840225082238"] = {
+            DisplayName = "1stM1"
+        },
+        ["rbxassetid://88761422474765"] = {
+            DisplayName = "2ndM1"
+        },
+        ["rbxassetid://98462236639320"] = {
+            DisplayName = "3rdM1"
+        },
+        ["rbxassetid://122451562066756"] = {
+            DisplayName = "4thM1"
+        },
+        -- Current Striker animations, calibrated as the progressively faster chain.
         ["rbxassetid://116642061934550"] = { DisplayName = "1stM1", ReactionTime = 0.20 },
         ["rbxassetid://115234849770695"] = { DisplayName = "2ndM1", ReactionTime = 0.18 },
-        ["rbxassetid://85554794950365"]  = { DisplayName = "3rdM1", ReactionTime = 0.05 },
-        ["rbxassetid://73777821288331"]  = { DisplayName = "4thM1", ReactionTime = 0.05 },
-        ["rbxassetid://99309341097380"]  = { DisplayName = "M2",    ReactionTime = 0.30 },
+        ["rbxassetid://85554794950365"] = { DisplayName = "3rdM1", ReactionTime = 0.05 },
+        ["rbxassetid://73777821288331"] = { DisplayName = "4thM1", ReactionTime = 0.05 },
+        ["rbxassetid://99309341097380"] = { DisplayName = "M2", ReactionTime = 0.30 },
     },
     ["KickboxingAnims"] = {
-        ["rbxassetid://127679697578124"] = { DisplayName = "1stM1" },
-        ["rbxassetid://111648334200984"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://109134308246065"] = { DisplayName = "3rdM1" },
-        ["rbxassetid://123237866254734"] = { DisplayName = "4thM1" },
-        ["rbxassetid://119415047601579"] = { DisplayName = "M2" },
-        ["rbxassetid://140240091451745"] = { DisplayName = "M2Success" },
-        ["rbxassetid://138270482936731"] = { DisplayName = "M2EHit" },
+        ["rbxassetid://127679697578124"] = { DisplayName = "1stM1", ReactionTime = 0.17 },
+        ["rbxassetid://111648334200984"] = { DisplayName = "2ndM1", ReactionTime = 0.18 },
+        ["rbxassetid://109134308246065"] = { DisplayName = "3rdM1", ReactionTime = 0.19 },
+        ["rbxassetid://123237866254734"] = { DisplayName = "4thM1", ReactionTime = 0.242 },
+        ["rbxassetid://119415047601579"] = { DisplayName = "M2", ReactionTime = 0.287 },
     },
     ["KyokushinAnims"] = {
-        ["rbxassetid://108157433609067"] = { DisplayName = "1stM1" },
-        ["rbxassetid://139691512657916"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://94267870513016"]  = { DisplayName = "3rdM1" },
-        ["rbxassetid://107365196082362"] = { DisplayName = "4thM1" },
-        ["rbxassetid://128363063231486"] = { DisplayName = "M2" },
-        ["rbxassetid://80822959210741"]  = { DisplayName = "M2", ReactionTime = 0.300 },
+        -- Latest Kyokushin values supplied by you.
+        ["rbxassetid://108157433609067"] = { DisplayName = "1stM1", ReactionTime = 0.10 },
+        ["rbxassetid://139691512657916"] = { DisplayName = "2ndM1", ReactionTime = 0.10 },
+        ["rbxassetid://94267870513016"] = { DisplayName = "3rdM1", ReactionTime = 0.14 },
+        ["rbxassetid://107365196082362"] = { DisplayName = "4thM1", ReactionTime = 0.24 },
+        ["rbxassetid://128363063231486"] = { DisplayName = "M2", ReactionTime = 0.25 },
     },
     ["CQCAnims"] = {
-        ["rbxassetid://80051878176163"]  = { DisplayName = "1stM1" },
-        ["rbxassetid://112809686330315"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://96690751054332"]  = { DisplayName = "3rdM1" },
-        ["rbxassetid://75394567475187"]  = { DisplayName = "4thM1" },
-        ["rbxassetid://136636440521127"] = { DisplayName = "M2", ReactionTime = 0.1 },
-        -- Alternate IDs from lolbeans67
+        -- CQC has multiple M2 tracks, so each variation is registered separately.
         ["rbxassetid://115957047639796"] = { DisplayName = "1stM1", ReactionTime = 0.20 },
         ["rbxassetid://139153666059747"] = { DisplayName = "2ndM1", ReactionTime = 0.20 },
-        ["rbxassetid://96433631480947"]  = { DisplayName = "3rdM1", ReactionTime = 0.10 },
+        ["rbxassetid://96433631480947"] = { DisplayName = "3rdM1", ReactionTime = 0.10 },
         ["rbxassetid://119132409702905"] = { DisplayName = "4thM1", ReactionTime = 0.24 },
-        ["rbxassetid://103319500580356"] = { DisplayName = "M2", ReactionTime = 0.30 },
         ["rbxassetid://135110210666200"] = { DisplayName = "M2", ReactionTime = 0.30 },
-        ["rbxassetid://72310116631906"]  = { DisplayName = "M2", ReactionTime = 0.30 },
+        ["rbxassetid://72310116631906"] = { DisplayName = "M2", ReactionTime = 0.30 },
+        ["rbxassetid://103319500580356"] = { DisplayName = "M2", ReactionTime = 0.30 },
     },
-    ["MishimaAnims"] = {
-        ["rbxassetid://122564675454774"] = { DisplayName = "1stM1" },
-        ["rbxassetid://124288660244802"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://116344736444569"] = { DisplayName = "3rdM1" },
-        ["rbxassetid://109354190051977"] = { DisplayName = "4thM1" },
-        ["rbxassetid://113531813891302"] = { DisplayName = "M2" },
+    ["KureAnims"] = {
+        ["rbxassetid://89598700542051"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.16
+        },
+        ["rbxassetid://84100769626105"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.16
+        },
+        ["rbxassetid://75725487794798"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.16
+        },
+        ["rbxassetid://103586798765773"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.16
+        },
+        ["rbxassetid://128246407698779"] = {
+            DisplayName = "M2",
+            ["ReactionTime"] = 0.1,
+        },
     },
     ["LethweiAnims"] = {
-        ["rbxassetid://126845586831338"] = { DisplayName = "1stM1" },
-        ["rbxassetid://111506889308405"] = { DisplayName = "2ndM1" },
-        ["rbxassetid://93862547414782"]  = { DisplayName = "3rdM1" },
-        ["rbxassetid://81747456615347"]  = { DisplayName = "4thM1" },
-        ["rbxassetid://98256190530845"]  = { DisplayName = "M2" },
+        ["rbxassetid://126845586831338"] = {
+            DisplayName = "1stM1",
+        },
+        ["rbxassetid://111506889308405"] = {
+            DisplayName = "2ndM1",
+        },
+        ["rbxassetid://93862547414782"] = {
+            DisplayName = "3rdM1",
+        },
+        ["rbxassetid://81747456615347"] = {
+            DisplayName = "4thM1",
+        },
+        ["rbxassetid://98256190530845"] = {
+            DisplayName = "M2",
+        },
+    },
+    ["MishimaAnims"] = {
+        ["rbxassetid://122564675454774"] = {
+            DisplayName = "1stM1",
+        },
+        ["rbxassetid://124288660244802"] = {
+            DisplayName = "2ndM1",
+        },
+        ["rbxassetid://116344736444569"] = {
+            DisplayName = "3rdM1",
+        },
+        ["rbxassetid://109354190051977"] = {
+            DisplayName = "4thM1",
+        },
+        ["rbxassetid://113531813891302"] = {
+            DisplayName = "M2",
+        },
     },
     ["JinAnims"] = {
-        ["rbxassetid://89404705737555"]  = { DisplayName = "1stM1", ReactionTime = 0.1 },
-        ["rbxassetid://126407816250012"] = { DisplayName = "2ndM1", ReactionTime = 0.1 },
-        ["rbxassetid://111599179234006"] = { DisplayName = "3rdM1", ReactionTime = 0.1 },
-        ["rbxassetid://115508221180588"] = { DisplayName = "4thM1", ReactionTime = 0.1 },
-        ["rbxassetid://90986005545750"]  = { DisplayName = "M2",    ReactionTime = 0.1 },
+        ["rbxassetid://89404705737555"] = { DisplayName = "1stM1" },
+        ["rbxassetid://126407816250012"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://111599179234006"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://115508221180588"] = { DisplayName = "4thM1" },
+        ["rbxassetid://90986005545750"] = { DisplayName = "M2" },
     },
     ["DragonAnims"] = {
-        ["rbxassetid://90632031214738"]  = { DisplayName = "1stM1", ReactionTime = 0.1 },
-        ["rbxassetid://129870265426519"] = { DisplayName = "2ndM1", ReactionTime = 0.1 },
-        ["rbxassetid://103119271372106"] = { DisplayName = "3rdM1", ReactionTime = 0.1 },
-        ["rbxassetid://81350056849630"]  = { DisplayName = "4thM1", ReactionTime = 0.1 },
-        ["rbxassetid://101059515516534"] = { DisplayName = "M2",    ReactionTime = 0.1 },
-        ["rbxassetid://101850612921423"] = { DisplayName = "M2",    ReactionTime = 0.1 },
+        ["rbxassetid://90632031214738"] = { DisplayName = "1stM1" },
+        ["rbxassetid://129870265426519"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://103119271372106"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://81350056849630"] = { DisplayName = "4thM1" },
+        -- Both M2 IDs are registered; their flip kick/dropkick labels are unconfirmed.
+        ["rbxassetid://101059515516534"] = { DisplayName = "M2" },
+        ["rbxassetid://101850612921423"] = { DisplayName = "M2" },
     },
-    ["PerfectCopyAnims"] = {
-        ["rbxassetid://89266206062347"]  = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://118618177788645"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://92563642848078"]  = { DisplayName = "3rdM1", ReactionTime = 0.150 },
-        ["rbxassetid://129685126037621"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://84779382426562"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
-        ["rbxassetid://123851034848865"] = { DisplayName = "M2",    ReactionTime = 0.300 },
+    ["PerfectcopyAnims"] = {
+        ["rbxassetid://89266206062347"] = { DisplayName = "1stM1" },
+        ["rbxassetid://118618177788645"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://92563642848078"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://129685126037621"] = { DisplayName = "4thM1" },
+        ["rbxassetid://84779382426562"] = { DisplayName = "M2" },
+        ["rbxassetid://123851034848865"] = { DisplayName = "M2" },
     },
-    ["AikidoAnims"] = {
-        ["rbxassetid://101667835774312"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://72100016327641"]  = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://86622096544948"]  = { DisplayName = "3rdM1", ReactionTime = 0.150 },
-        ["rbxassetid://116579071175823"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        -- Counter (like Wing Chun M2): always parry, never auto-dodge
-        ["rbxassetid://113723231962801"] = { DisplayName = "M2", ReactionTime = 0.200, ForceParry = true },
+    ["AkidoAnims"] = {
+        ["rbxassetid://101667835774312"] = { DisplayName = "1stM1" },
+        ["rbxassetid://72100016327641"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://86622096544948"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://116579071175823"] = { DisplayName = "4thM1" },
+        ["rbxassetid://113723231962801"] = { DisplayName = "M2", Counter = true },
     },
-    ["TaijutsuAnims"] = {
-        ["rbxassetid://112772003891760"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://120968355159054"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://134363734889174"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
-        ["rbxassetid://140439623648569"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://70666956463595"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
+    ["TaijustuAnims"] = {
+        ["rbxassetid://112772003891760"] = { DisplayName = "1stM1" },
+        ["rbxassetid://120968355159054"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://134363734889174"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://140439623648569"] = { DisplayName = "4thM1" },
+        ["rbxassetid://70666956463595"] = { DisplayName = "M2" },
     },
     ["GiovannaAnims"] = {
-        ["rbxassetid://135716459366783"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://128178940723536"] = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://133339208745195"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
-        ["rbxassetid://129619149164145"] = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://84500842912133"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
+        ["rbxassetid://135716459366783"] = { DisplayName = "1stM1" },
+        ["rbxassetid://128178940723536"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://133339208745195"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://129619149164145"] = { DisplayName = "4thM1" },
+        ["rbxassetid://84500842912133"] = { DisplayName = "M2" },
     },
     ["HikakenAnims"] = {
-        ["rbxassetid://109471728828625"] = { DisplayName = "1stM1", ReactionTime = 0.150 },
-        ["rbxassetid://92152402802393"]  = { DisplayName = "2ndM1", ReactionTime = 0.150 },
-        ["rbxassetid://139736320509560"] = { DisplayName = "3rdM1", ReactionTime = 0.150 },
-        ["rbxassetid://80033824766939"]  = { DisplayName = "4thM1", ReactionTime = 0.150 },
-        ["rbxassetid://94916233438251"]  = { DisplayName = "M2",    ReactionTime = 0.300 },
+        ["rbxassetid://109471728828625"] = { DisplayName = "1stM1" },
+        ["rbxassetid://92152402802393"] = { DisplayName = "2ndM1" },
+        ["rbxassetid://139736320509560"] = { DisplayName = "3rdM1" },
+        ["rbxassetid://80033824766939"] = { DisplayName = "4thM1" },
+        ["rbxassetid://94916233438251"] = { DisplayName = "M2" },
+    },
+    ["WingChun"] = {
+        ["rbxassetid://135699957281468"] = {
+            DisplayName = "4thM1",
+            ReactionTime = 0.52
+        },
+        ["rbxassetid://125237241325107"] = {
+            DisplayName = "M2",
+            ["ReactionTime"] = 0.06,
+        },
+        ["rbxassetid://94976161225956"] = {
+            DisplayName = "1stM1",
+            ReactionTime = 0.16
+        },
+        ["rbxassetid://130903067566077"] = {
+            DisplayName = "2ndM1",
+            ReactionTime = 0.16
+        },
+        ["rbxassetid://139503477666199"] = {
+            DisplayName = "3rdM1",
+            ReactionTime = 0.16
+        },
+    },
+    ["HakariOtherAnims"] = {
+        ["rbxassetid://126612786608030"] = {
+            DisplayName = "1stM1"
+        },
+        ["rbxassetid://113719263885794"] = {
+            DisplayName = "2ndM1"
+        },
+        ["rbxassetid://136305578634960"] = {
+            DisplayName = "3rdM1"
+        },
+        ["rbxassetid://89039586375625"] = {
+            DisplayName = "4thM1"
+        },
+        ["rbxassetid://82855179231529"] = {
+            DisplayName = "MomentumM2"
+        },
+        ["rbxassetid://101619248052969"] = {
+            DisplayName = "M2"
+        },
     },
     ["Debug"] = {
-        ["http://www.roblox.com/asset/?id=125750702"] = { DisplayName = "M1", ReactionTime = 0.3 },
+        ["http://www.roblox.com/asset/?id=125750702"] = {
+            DisplayName = "M1",
+            ReactionTime = 0.3,
+        },
     },
 }
 
-local FlatConfig = {}
-local DefaultRT = 0.1
-for style, anims in pairs(GameConfig) do
-    local styleRT = anims.M1Time
-    for id, data in pairs(anims) do
-        if type(id) == "string" and type(data) == "table"
-            and (id:find("rbxassetid://", 1, true) or id:find("http://", 1, true) or id:find("rbxassetid", 1, true)) then
-            local f = {}
-            for k, v in pairs(data) do f[k] = v end
-            f.Style = style
-            f.ReactionTime = f.ReactionTime or f.ParryTime or styleRT or DefaultRT
-            local name = tostring(f.DisplayName or "")
-            if name:find("M2") or name == "Heavy" then f.Heavy = true end
-            FlatConfig[id] = f
-        end
-    end
-end
-GameConfig = FlatConfig
+local IgnoreIds = {
+    73766443218740, 111699625251889, 85823794654077, 99661732639863, 106268941365574, 109816855387997, 122561749929324, 129805948180599,
+    90752347516770, 135133599113049, 132695091086148, 137015026151472, 114511731321756, 100794890036133, 109303037515668, 117293898907979,
+    74690341409113, 73090768467054, 72284079162560, 89016181362524, 76945839486275, 101161965631044, 128307941333158, 85931837451298,
+    91352556581859, 77911299793653, 129335968179665, 122384188141033, 132695766056641, 113331696487725, 124220338099067, 99799500309776,
+    108636808436488, 90015977935891, 87932588807124, 132477488202815, 102982320608759, 109278619250401, 79971841883936, 97783129267001,
+    72822821848529, 79974955602012, 77798715679680, 85845666927963, 108862846290180, 108045962864902, 93184693099565, 120399899079666,
+    99958962160522, 93221784050620, 70767328707698,
+}
 
--- Awakened / alternate M2 IDs (ported from lolbeans67) — same timings as base, labeled for UI
-do
-    local function cloneAnim(fromId, toId, flags)
-        local src = GameConfig[fromId]
-        if not src then return end
-        local copy = {}
-        for k, v in pairs(src) do copy[k] = v end
-        if flags then for k, v in pairs(flags) do copy[k] = v end end
-        GameConfig[toId] = copy
+local ParriedAnimation = {
+    "rbxassetid://100773926241456", "rbxassetid://102823909334302", "rbxassetid://96304721384743",
+    "rbxassetid://82979105739696", "rbxassetid://96600699015093", "rbxassetid://138519505081692",
+}
+local StunnedAnimation = {
+    "rbxassetid://122541287927198", "rbxassetid://83600639547203", "rbxassetid://80309578200579",
+    "rbxassetid://92787945841620", "rbxassetid://108045962864902", "rbxassetid://104407197874289",
+}
+local ParryingAnimation = {
+    "rbxassetid://118147060185189", "rbxassetid://80135556847061", "rbxassetid://88718564310179",
+}
+local ParryFailed = { "rbxassetid://4210597123" }
+
+-- O(1) lookup sets (hot paths use these instead of table.find)
+local function BuildSet(list)
+    local set = {}
+    for _, v in ipairs(list) do
+        set[v] = true
+        set[tostring(v)] = true
     end
-    cloneAnim("rbxassetid://128921678079615", "rbxassetid://132891856788045", { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://91419261625463",  "rbxassetid://83352556099235",  { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://90986005545750",  "rbxassetid://85984892267786",  { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://78127273702521",  "rbxassetid://82076026376495",  { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://78127273702521",  "rbxassetid://137954350192006",  { Blackflash = true, DisplayName = "Blackflash M2" })
-    cloneAnim("rbxassetid://137299369381761", "rbxassetid://124394929276448",  { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://98256190530845",  "rbxassetid://120251079111989",  { DisplayName = "M2" })
-    cloneAnim("rbxassetid://120251079111989", "rbxassetid://100495393065612",  { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://70666956463595",  "rbxassetid://139458993289546",  { Awakened = true, DisplayName = "M2 (Awakened)" })
-    cloneAnim("rbxassetid://128363063231486", "rbxassetid://80822959210741",   { DisplayName = "M2" })
+    return set
 end
 
+local IgnoreIdSet = BuildSet(IgnoreIds)
+local ParriedAnimSet = BuildSet(ParriedAnimation)
+local StunnedAnimSet = BuildSet(StunnedAnimation)
+local ParryingAnimSet = BuildSet(ParryingAnimation)
+local ParryFailedSet = BuildSet(ParryFailed)
 
--- Godzz timing overrides — standardised reaction times across known ids
-do
-    local Godzz = {
-        ["rbxassetid://100249628136368"] = 0.180, ["rbxassetid://100661797632126"] = 0.150,
-        ["rbxassetid://101059515516534"] = 0.450, ["rbxassetid://101160496635774"] = 0.150,
-        ["rbxassetid://101740002500802"] = 0.330, ["rbxassetid://101850612921423"] = 0.450,
-        ["rbxassetid://103119271372106"] = 0.170, ["rbxassetid://103211517133243"] = 0.130,
-        ["rbxassetid://103586798765773"] = 0.150, ["rbxassetid://103717575086418"] = 0.160,
-        ["rbxassetid://104356393941647"] = 0.220, ["rbxassetid://107365196082362"] = 0.335,
-        ["rbxassetid://108157433609067"] = 0.125, ["rbxassetid://109134308246065"] = 0.230,
-        ["rbxassetid://109354190051977"] = 0.110, ["rbxassetid://109925400698635"] = 0.120,
-        ["rbxassetid://110917888708142"] = 0.160, ["rbxassetid://111506889308405"] = 0.260,
-        ["rbxassetid://111599179234006"] = 0.195, ["rbxassetid://111648334200984"] = 0.180,
-        ["rbxassetid://112809686330315"] = 0.225, ["rbxassetid://113531813891302"] = 0.150,
-        ["rbxassetid://115207134396914"] = 0.160, ["rbxassetid://115508221180588"] = 0.400,
-        ["rbxassetid://116278224437295"] = 0.310, ["rbxassetid://116344736444569"] = 0.120,
-        ["rbxassetid://117315538657801"] = 0.150, ["rbxassetid://119415047601579"] = 0.180,
-        ["rbxassetid://121264916189386"] = 0.060, ["rbxassetid://122564675454774"] = 0.110,
-        ["rbxassetid://123215666398014"] = 0.150, ["rbxassetid://123237866254734"] = 0.290,
-        ["rbxassetid://124288660244802"] = 0.110, ["rbxassetid://124808151650835"] = 0.160,
-        ["rbxassetid://125237241325107"] = 0.070, ["rbxassetid://125556631043249"] = 0.060,
-        ["rbxassetid://126407816250012"] = 0.420, ["rbxassetid://126463147281440"] = 0.170,
-        ["rbxassetid://126845586831338"] = 0.290, ["rbxassetid://127465095270110"] = 0.280,
-        ["rbxassetid://127487637547915"] = 0.290, ["rbxassetid://127679697578124"] = 0.170,
-        ["rbxassetid://127941398150401"] = 0.260, ["rbxassetid://128246407698779"] = 0.105,
-        ["rbxassetid://128363063231486"] = 0.620, ["rbxassetid://128600830397859"] = 0.310,
-        ["rbxassetid://128921678079615"] = 0.100, ["rbxassetid://129031831390386"] = 0.158,
-        ["rbxassetid://129870265426519"] = 0.220, ["rbxassetid://130903067566077"] = 0.120,
-        ["rbxassetid://132913269853139"] = 0.190, ["rbxassetid://135699957281468"] = 0.470,
-        ["rbxassetid://136346659171696"] = 0.160, ["rbxassetid://136830198456192"] = 0.180,
-        ["rbxassetid://137299369381761"] = 0.380, ["rbxassetid://137514920199894"] = 0.160,
-        ["rbxassetid://139503477666199"] = 0.120, ["rbxassetid://139691512657916"] = 0.140,
-        ["rbxassetid://72779501873271"]  = 0.210, ["rbxassetid://74020075116139"]  = 0.200,
-        ["rbxassetid://74337052553355"]  = 0.190, ["rbxassetid://75394567475187"]  = 0.310,
-        ["rbxassetid://75666664304014"]  = 0.200, ["rbxassetid://75725487794798"]  = 0.160,
-        ["rbxassetid://76033376851583"]  = 0.180, ["rbxassetid://76458394174684"]  = 0.220,
-        ["rbxassetid://78127273702521"]  = 0.200, ["rbxassetid://78852386182257"]  = 0.290,
-        ["rbxassetid://79017113400162"]  = 0.170, ["rbxassetid://79224782278508"]  = 0.210,
-        ["rbxassetid://79996486219181"]  = 0.160, ["rbxassetid://80051878176163"]  = 0.225,
-        ["rbxassetid://80331331149375"]  = 0.310, ["rbxassetid://81350056849630"]  = 0.170,
-        ["rbxassetid://81488798354194"]  = 0.410, ["rbxassetid://81747456615347"]  = 0.220,
-        ["rbxassetid://83771012317903"]  = 0.150, ["rbxassetid://84100769626105"]  = 0.170,
-        ["rbxassetid://86882821333237"]  = 0.600, ["rbxassetid://88548871262625"]  = 0.180,
-        ["rbxassetid://89404705737555"]  = 0.230, ["rbxassetid://89598700542051"]  = 0.180,
-        ["rbxassetid://89706363973188"]  = 0.270, ["rbxassetid://90445272780399"]  = 0.150,
-        ["rbxassetid://90632031214738"]  = 0.170, ["rbxassetid://90986005545750"]  = 0.180,
-        ["rbxassetid://91419261625463"]  = 0.160, ["rbxassetid://91953931348325"]  = 0.160,
-        ["rbxassetid://92831721340116"]  = 0.340, ["rbxassetid://93862547414782"]  = 0.250,
-        ["rbxassetid://94267870513016"]  = 0.170, ["rbxassetid://94976161225956"]  = 0.120,
-        ["rbxassetid://96690751054332"]  = 0.190, ["rbxassetid://97696355281722"]  = 0.200,
-        ["rbxassetid://98256190530845"]  = 0.260, ["rbxassetid://98872276178039"]  = 0.220,
-        ["http://www.roblox.com/asset/?id=125750702"] = 0.310,
-        -- Newer styles (starting defaults; tune in Timings tab)
-        ["rbxassetid://89266206062347"]  = 0.150, ["rbxassetid://118618177788645"] = 0.150,
-        ["rbxassetid://92563642848078"]  = 0.150, ["rbxassetid://129685126037621"] = 0.150,
-        ["rbxassetid://84779382426562"]  = 0.300, ["rbxassetid://123851034848865"] = 0.300,
-        ["rbxassetid://101667835774312"] = 0.150, ["rbxassetid://72100016327641"]  = 0.150,
-        ["rbxassetid://86622096544948"]  = 0.150, ["rbxassetid://116579071175823"] = 0.150,
-        ["rbxassetid://113723231962801"] = 0.200, ["rbxassetid://112772003891760"] = 0.150,
-        ["rbxassetid://120968355159054"] = 0.150, ["rbxassetid://134363734889174"] = 0.150,
-        ["rbxassetid://140439623648569"] = 0.150, ["rbxassetid://70666956463595"]  = 0.300,
-        ["rbxassetid://135716459366783"] = 0.150, ["rbxassetid://128178940723536"] = 0.150,
-        ["rbxassetid://133339208745195"] = 0.150, ["rbxassetid://129619149164145"] = 0.150,
-        ["rbxassetid://84500842912133"]  = 0.300, ["rbxassetid://109471728828625"] = 0.150,
-        ["rbxassetid://92152402802393"]  = 0.150, ["rbxassetid://139736320509560"] = 0.150,
-        ["rbxassetid://80033824766939"]  = 0.150, ["rbxassetid://94916233438251"]  = 0.300,
-        ["rbxassetid://80822959210741"]  = 0.300, ["rbxassetid://132840225082238"] = 0.210,
-        ["rbxassetid://88761422474765"]  = 0.190, ["rbxassetid://98462236639320"]  = 0.060,
-        ["rbxassetid://122451562066756"] = 0.060, ["rbxassetid://116642061934550"] = 0.200,
-        ["rbxassetid://115234849770695"] = 0.180, ["rbxassetid://85554794950365"]  = 0.050,
-        ["rbxassetid://73777821288331"]  = 0.050, ["rbxassetid://99309341097380"]  = 0.300,
-    }
-    local n = 0
-    for id, rt in pairs(Godzz) do
-        local info = GameConfig[id]
-        if info then
-            info.ReactionTime = rt
-            n = n + 1
-        end
-    end
-    -- Keep a frozen copy for Reset Timings
-    for id, info in pairs(GameConfig) do
-        if FlatConfig[id] then
-            FlatConfig[id].ReactionTime = info.ReactionTime
-        end
-    end
-    print("[Syndicatus] Godzz + new-style defaults applied (" .. n .. " timings)")
+local function RebuildIgnoreIdSet()
+    IgnoreIdSet = BuildSet(IgnoreIds)
 end
 
--- ── Multi-Config ────────────────────────────
-local PROFILE_FOLDER = "Syndicatus"
+local AutoParryRange = 10
+local MaxCycleRange = 20
+local ParryWindow = 0.2
+local ProbabilityToParry = 100
+local DefaultReactionTime = 0.1
+local ParryOffset = 0
+local BlockHoldTime = 0.27
+
+-- Ping helper (used every frame when evaluating attacks — MUST exist)
+local _pingCacheMs = 50
+local _pingCacheAt = 0
+local function GetPingValue()
+    local now = os.clock()
+    if (now - _pingCacheAt) < 0.25 then
+        return _pingCacheMs
+    end
+    local ping = 50
+    pcall(function()
+        local stats = game:GetService("Stats")
+        local item = stats
+            and stats.Network
+            and stats.Network.ServerStatsItem
+            and stats.Network.ServerStatsItem["Data Ping"]
+        if item and item.GetValue then
+            ping = item:GetValue() or ping
+        end
+    end)
+    pcall(function()
+        if LocalPlayer and type(LocalPlayer.GetNetworkPing) == "function" then
+            local p = LocalPlayer:GetNetworkPing()
+            if type(p) == "number" then
+                ping = p * 1000
+            end
+        end
+    end)
+    _pingCacheMs = tonumber(ping) or 50
+    _pingCacheAt = now
+    return _pingCacheMs
+end
+
+local CachedPing = 50
+local function GetCachedPing()
+    return CachedPing or GetPingValue()
+end
+
+-- iskeypressed is an executor global; provide a safe fallback so combat never nil-calls
+local _rawIsKeyPressed = (type(iskeypressed) == "function" and iskeypressed) or nil
+local function iskeypressed(code)
+    if _rawIsKeyPressed then
+        local ok, result = pcall(_rawIsKeyPressed, code)
+        if ok then return result and true or false end
+    end
+    -- Fallback via UserInputService (code is virtual-key byte, e.g. string.byte("F") == 70)
+    local ok, down = pcall(function()
+        local uis = game:GetService("UserInputService")
+        local map = {
+            [70] = Enum.KeyCode.F,   -- F
+            [81] = Enum.KeyCode.Q,   -- Q
+            [32] = Enum.KeyCode.Space,
+            [88] = Enum.KeyCode.X,
+            [71] = Enum.KeyCode.G,
+            [90] = Enum.KeyCode.Z,
+        }
+        local kc = map[code]
+        if not kc then return false end
+        return uis:IsKeyDown(kc)
+    end)
+    return ok and down or false
+end
+
+-- keypress / keyrelease: ensure callable so rhythm + combat never nil-call
+if type(keypress) ~= "function" then
+    function keypress(_) end
+end
+if type(keyrelease) ~= "function" then
+    function keyrelease(_) end
+end
+
+
+-- ==========================================
+local FlattenedConfig = {}
+
+for styleName, assets in pairs(GameConfig) do
+    local m1Time = assets["M1Time"]
+    for assetId, data in pairs(assets) do
+        if assetId == "M1Time" then continue end
+
+        local flatData = table.clone(data) or {}
+        flatData.Style = styleName
+
+        if data.DisplayName ~= "M2" and m1Time then
+            flatData.ReactionTime = m1Time
+        elseif not data.ReactionTime then
+            flatData.ReactionTime = DefaultReactionTime
+        end
+
+        FlattenedConfig[assetId] = flatData
+    end
+end
+
+GameConfig = FlattenedConfig
+
+-- New M2 animation IDs retain the existing normal M2 settings as a baseline.
+GameConfig["rbxassetid://80822959210741"] = table.clone(GameConfig["rbxassetid://128363063231486"])
+GameConfig["rbxassetid://132891856788045"] = table.clone(GameConfig["rbxassetid://128921678079615"])
+GameConfig["rbxassetid://132891856788045"].Awakened = true
+GameConfig["rbxassetid://83352556099235"] = table.clone(GameConfig["rbxassetid://91419261625463"])
+GameConfig["rbxassetid://83352556099235"].Awakened = true
+GameConfig["rbxassetid://85984892267786"] = table.clone(GameConfig["rbxassetid://90986005545750"])
+GameConfig["rbxassetid://85984892267786"].Awakened = true
+GameConfig["rbxassetid://82076026376495"] = table.clone(GameConfig["rbxassetid://78127273702521"])
+GameConfig["rbxassetid://82076026376495"].Awakened = true
+-- Blackflash uses this same animation ID in both normal and awakened forms.
+GameConfig["rbxassetid://137954350192006"] = table.clone(GameConfig["rbxassetid://78127273702521"])
+GameConfig["rbxassetid://137954350192006"].Blackflash = true
+GameConfig["rbxassetid://124394929276448"] = table.clone(GameConfig["rbxassetid://137299369381761"])
+GameConfig["rbxassetid://124394929276448"].Awakened = true
+GameConfig["rbxassetid://120251079111989"] = table.clone(GameConfig["rbxassetid://98256190530845"])
+GameConfig["rbxassetid://100495393065612"] = table.clone(GameConfig["rbxassetid://120251079111989"])
+GameConfig["rbxassetid://100495393065612"].Awakened = true
+GameConfig["rbxassetid://139458993289546"] = table.clone(GameConfig["rbxassetid://70666956463595"])
+GameConfig["rbxassetid://139458993289546"].Awakened = true
+
+-- Frozen baseline timings for Reset / Default profile
+local OriginalTimings = {}
+for id, info in pairs(GameConfig) do
+    OriginalTimings[id] = info.ReactionTime or DefaultReactionTime
+end
+
+local AnimationIdSliders = {}
+local bindStyle = nil -- filled by CreateGroupSliders (per-style button selector)
+local currentStyleEditName = nil
+
+-- ==========================================
+-- Config System — Lua profiles (JSON fallback for legacy / imports)
+-- ==========================================
+local PROFILE_FOLDER = "sharingan_ap"
+local LEGACY_FOLDERS = { "GakuranConfigs" } -- beerus-style drop-in
+local PROFILE_FORMAT = "SharinganConfig"
+local PROFILE_VERSION = 2
 local profileSourceMap = {}
+local selectedConfig = "Default"
+local currentProfileName = "Default"
+local LAST_SAVE_LOG = { ok = false }
+local CONFIG_DEBUG = false -- flipped by Save/Load buttons at bottom of this file
 
-local function ensureFolder()
-    if not isfolder(PROFILE_FOLDER) then makefolder(PROFILE_FOLDER) end
+-- Executor I/O probes (single table to keep top-level locals under Luau's 200 limit)
+local IO_OK = {
+    writefile  = type(writefile)  == "function",
+    readfile   = type(readfile)   == "function",
+    listfiles  = type(listfiles)  == "function",
+    isfolder   = type(isfolder)   == "function",
+    makefolder = type(makefolder) == "function",
+    delfile    = type(delfile)    == "function",
+    loadstring = type(loadstring) == "function",
+}
+
+local function cfglog(...)
+    if CONFIG_DEBUG then
+        print("[Config]", ...)
+    end
+end
+
+local function ensureProfileFolder()
+    if IO_OK.isfolder and IO_OK.makefolder and not isfolder(PROFILE_FOLDER) then
+        pcall(makefolder, PROFILE_FOLDER)
+    end
+end
+
+-- ========== Lua table serializer ==========
+local serializeTable
+local function serializeValue(v, indent)
+    local t = type(v)
+    if v == nil then return "nil" end
+    if t == "boolean" then return tostring(v) end
+    if t == "number" then
+        if v ~= v then return "0/0" end
+        if v == math.huge then return "math.huge" end
+        if v == -math.huge then return "-math.huge" end
+        return tostring(v)
+    end
+    if t == "string" then return string.format("%q", v) end
+    if t == "table" then return serializeTable(v, indent) end
+    return "nil"
+end
+
+serializeTable = function(tbl, indent)
+    indent = indent or ""
+    local nextIndent = indent .. "  "
+    local parts = { "{\n" }
+    local isArray = true
+    local maxIndex = 0
+    local keyCount = 0
+    for k in pairs(tbl) do
+        keyCount = keyCount + 1
+        if type(k) ~= "number" or k % 1 ~= 0 or k < 1 then
+            isArray = false
+        elseif k > maxIndex then
+            maxIndex = k
+        end
+    end
+    if isArray and maxIndex ~= keyCount then isArray = false end
+
+    if isArray then
+        for i = 1, maxIndex do
+            table.insert(parts, nextIndent)
+            table.insert(parts, serializeValue(tbl[i], nextIndent))
+            table.insert(parts, ",\n")
+        end
+    else
+        local stringKeys, numericKeys = {}, {}
+        for k in pairs(tbl) do
+            if type(k) == "string" then
+                table.insert(stringKeys, k)
+            elseif type(k) == "number" then
+                table.insert(numericKeys, k)
+            end
+        end
+        table.sort(stringKeys)
+        table.sort(numericKeys)
+        for _, k in ipairs(numericKeys) do
+            table.insert(parts, nextIndent)
+            table.insert(parts, string.format("[%s] = ", tostring(k)))
+            table.insert(parts, serializeValue(tbl[k], nextIndent))
+            table.insert(parts, ",\n")
+        end
+        for _, k in ipairs(stringKeys) do
+            table.insert(parts, nextIndent)
+            table.insert(parts, string.format("[%q] = ", k))
+            table.insert(parts, serializeValue(tbl[k], nextIndent))
+            table.insert(parts, ",\n")
+        end
+    end
+    table.insert(parts, indent)
+    table.insert(parts, "}")
+    return table.concat(parts)
+end
+
+local function serializeProfile(payload, name)
+    -- The file content MUST be a bare table literal — nothing else. Some
+    -- executors (e.g. Matcha) implement `loadstring(x)` as `load("return " .. x)`
+    -- internally. That means:
+    --   `return {...}`               → `return return {...}` → parse error
+    --   `local X = {...} return X`   → `return local X = ...`  → parse error
+    --   `-- comment\n{...}`          → `return -- comment\n{...}` → nil
+    -- Only a pure `{...}` expression survives both wrap-as-expression and
+    -- standard loadstring (via our Strategy 2 explicit return-wrap on load).
+    -- No leading comments. We embed metadata INSIDE the table as fields.
+    payload._savedAt = tostring(os.date("%Y-%m-%d %H:%M:%S"))
+    payload._name = tostring(name or "unnamed")
+    return serializeTable(payload, "")
+end
+
+-- ========== Discovery (both .lua and legacy .json, both folders) ==========
+local function scanFolder(folder, names)
+    if not IO_OK.listfiles then return end
+    local files = {}
+    pcall(function() files = listfiles(folder) or {} end)
+    if #files == 0 then
+        pcall(function() files = listfiles(folder .. "/") or {} end)
+    end
+    for _, f in pairs(files) do
+        local s = tostring(f)
+        local nLua = s:match("([^/\\]+)%.lua$")
+        local nJson = s:match("([^/\\]+)%.json$")
+        if nLua then
+            if not profileSourceMap[nLua] or profileSourceMap[nLua].format ~= "lua" then
+                table.insert(names, nLua)
+                profileSourceMap[nLua] = { format = "lua", path = s }
+            end
+        elseif nJson then
+            if not profileSourceMap[nJson] then
+                table.insert(names, nJson)
+                profileSourceMap[nJson] = { format = "json", path = s }
+            end
+        end
+    end
 end
 
 local function listProfiles()
     table.clear(profileSourceMap)
+    ensureProfileFolder()
     local names = {}
-    ensureFolder()
-    local files = {}
-    pcall(function() files = listfiles(PROFILE_FOLDER) or {} end)
-    if #files == 0 then
-        pcall(function() files = listfiles(PROFILE_FOLDER .. "/") or {} end)
+    scanFolder(PROFILE_FOLDER, names)
+    for _, legacy in ipairs(LEGACY_FOLDERS) do
+        scanFolder(legacy, names)
     end
-    for _, f in pairs(files) do
-        local s = tostring(f)
-        local n = s:match("([^/\\]+)%.json$")
-        if n then
-            table.insert(names, n)
-            profileSourceMap[n] = { format = "json", path = s }
+
+    local seen, out = {}, {}
+    for _, n in ipairs(names) do
+        if not seen[n] then
+            seen[n] = true
+            table.insert(out, n)
         end
     end
-    table.sort(names)
-    return #names > 0 and names or { "Default" }
-end
-
-local function saveProfile(name, data)
-    ensureFolder()
-    local json = HttpService:JSONEncode(data)
-    local paths = {
-        PROFILE_FOLDER .. "/" .. name .. ".json",
-        PROFILE_FOLDER .. "\\" .. name .. ".json",
-    }
-    for _, fpath in ipairs(paths) do
-        local ok = pcall(function() writefile(fpath, json) end)
-        if ok then return fpath end
+    table.sort(out)
+    if #out == 0 then return { "Default" } end
+    local hasDefault = false
+    for _, n in ipairs(out) do
+        if n == "Default" then hasDefault = true break end
     end
-    return nil
+    if not hasDefault then table.insert(out, 1, "Default") end
+    return out
 end
 
+-- ========== Save ==========
+local function saveProfile(name, payload)
+    if not IO_OK.writefile then
+        LAST_SAVE_LOG = { ok = false, err = "writefile unavailable" }
+        return nil, "writefile unavailable"
+    end
+    ensureProfileFolder()
+    local source = serializeProfile(payload, name)
+    cfglog("SAVE", name, "bytes=" .. #source)
+
+    local paths = {
+        PROFILE_FOLDER .. "/" .. name .. ".lua",
+        PROFILE_FOLDER .. "\\" .. name .. ".lua",
+    }
+    local lastErr
+    local savedLuaPath
+    for _, fpath in ipairs(paths) do
+        local ok, err = pcall(writefile, fpath, source)
+        if ok then
+            local verified = true
+            if IO_OK.readfile then
+                local okR, back = pcall(readfile, fpath)
+                verified = okR and type(back) == "string" and #back > 0
+                if verified then
+                    cfglog("SAVE verified", fpath, "bytes=" .. #back)
+                end
+            end
+            if verified then
+                savedLuaPath = fpath
+                break
+            end
+        else
+            lastErr = err
+        end
+    end
+
+    if not savedLuaPath then
+        LAST_SAVE_LOG = { ok = false, err = tostring(lastErr) }
+        return nil, lastErr
+    end
+
+    -- Also write a JSON companion. On executors with quirky loadstring (Matcha
+    -- wraps input as `return <text>`, breaking anything but a bare expression)
+    -- the .json is the reliable load path. loadProfile tries it first.
+    local jsonPath = PROFILE_FOLDER .. "/" .. name .. ".json"
+    local jsonOk, jsonErr = pcall(function()
+        local json = HttpService:JSONEncode(payload)
+        writefile(jsonPath, json)
+        return #json
+    end)
+    if jsonOk then
+        cfglog("SAVE json companion", jsonPath)
+    else
+        cfglog("SAVE json companion FAILED", tostring(jsonErr))
+        print("[Profiles] WARNING: json companion failed:", jsonErr)
+    end
+
+    LAST_SAVE_LOG = { ok = true, path = savedLuaPath, bytes = #source, json = jsonOk }
+    return savedLuaPath
+end
+
+-- ========== Load ==========
 local function loadProfile(name)
     local src = profileSourceMap[name]
-    if not src then listProfiles() src = profileSourceMap[name] end
-    if not src then return nil end
-    local ok, data = pcall(function()
-        return HttpService:JSONDecode(readfile(src.path))
-    end)
-    return ok and data or nil
+    if not src then
+        listProfiles()
+        src = profileSourceMap[name]
+    end
+    if not src then return nil, "profile not found" end
+    if not IO_OK.readfile then return nil, "readfile unavailable" end
+
+    local okRead, text = pcall(readfile, src.path)
+    if not okRead or type(text) ~= "string" then
+        cfglog("LOAD readfile failed", src.path)
+        return nil, "readfile failed"
+    end
+
+    if src.format == "lua" then
+        if not IO_OK.loadstring then return nil, "loadstring unavailable" end
+
+        -- PRIORITY: if we saved this file ourselves we also wrote a .json
+        -- companion. JSON parsing is reliable across every executor, Lua
+        -- loadstring is not — so try the companion FIRST when it exists.
+        if IO_OK.readfile then
+            local jsonAlt = src.path:gsub("%.lua$", ".json")
+            if jsonAlt ~= src.path then
+                local okAlt, altText = pcall(readfile, jsonAlt)
+                if okAlt and type(altText) == "string" and #altText > 0 then
+                    local okJ, altData = pcall(function() return HttpService:JSONDecode(altText) end)
+                    if okJ and type(altData) == "table" then
+                        cfglog("LOAD json companion", jsonAlt)
+                        return altData
+                    end
+                end
+            end
+        end
+
+        local lastErr
+
+        -- Strategy 1: run text as-is. On Matcha-style loadstring (wraps as
+        -- `return <text>` internally) this works for a bare table literal.
+        local chunk, parseErr = loadstring(text)
+        if chunk then
+            local okRun, data = pcall(chunk)
+            if okRun and type(data) == "table" then
+                cfglog("LOAD lua ok (direct)", src.path)
+                return data
+            end
+            if not okRun then
+                lastErr = "runtime: " .. tostring(data)
+            end
+        else
+            lastErr = "parse: " .. tostring(parseErr)
+        end
+
+        -- Strategy 2: standard loadstring expects a statement, so wrap bare
+        -- expressions with explicit `return`. ONLY runs when strategy 1
+        -- failed to compile — otherwise on Matcha this would double-wrap
+        -- (`return return (...)`) and spam the console.
+        if not chunk then
+            local chunk2 = loadstring("return " .. text)
+            if chunk2 then
+                local ok2, data2 = pcall(chunk2)
+                if ok2 and type(data2) == "table" then
+                    cfglog("LOAD lua ok (return-wrapped)", src.path)
+                    return data2
+                end
+                if not ok2 then lastErr = "runtime (wrapped): " .. tostring(data2) end
+            end
+        end
+
+        -- Strategy 3: run in captured env, scan for a global config variable
+        -- (beerus / Gakuran commonly assign without an explicit return).
+        local CANDIDATE_NAMES = { "Config", "Profile", "Settings",
+            "GakuranConfig", "GakuranConfigs", "Export", "Data", "T", "M" }
+        if chunk then
+            local env = setmetatable({}, { __index = _G })
+            local okFenv = pcall(function() setfenv(chunk, env) end)
+            if okFenv then
+                pcall(chunk)
+                for _, cname in ipairs(CANDIDATE_NAMES) do
+                    if type(env[cname]) == "table" then
+                        cfglog("LOAD lua ok (env." .. cname .. ")", src.path)
+                        return env[cname]
+                    end
+                end
+                for k, v in pairs(env) do
+                    if type(v) == "table" and (v.Timings or v.Settings or v.Format) then
+                        cfglog("LOAD lua ok (env scan)", src.path, tostring(k))
+                        return v
+                    end
+                end
+            end
+        end
+
+        -- Strategy 4: text-rewrite — strip `local` from leading `local Name =`
+        -- so the value lands in our captured env for scanning. Handles beerus
+        -- files like `local Config = {...}` with no return.
+        for _, cname in ipairs(CANDIDATE_NAMES) do
+            local rewritten, n = text:gsub("local%s+" .. cname .. "%s*=", cname .. " =", 1)
+            if n > 0 then
+                local chunk4 = loadstring(rewritten)
+                if chunk4 then
+                    local env4 = setmetatable({}, { __index = _G })
+                    local okFenv4 = pcall(function() setfenv(chunk4, env4) end)
+                    if okFenv4 then
+                        pcall(chunk4)
+                        if type(env4[cname]) == "table" then
+                            cfglog("LOAD lua ok (strip-local " .. cname .. ")", src.path)
+                            return env4[cname]
+                        end
+                    end
+                end
+            end
+        end
+
+        return nil, lastErr or "no load strategy produced a table"
+    else
+        local ok, data = pcall(function() return HttpService:JSONDecode(text) end)
+        if not ok or type(data) ~= "table" then
+            cfglog("LOAD json decode failed")
+            return nil, "JSON decode failed"
+        end
+        cfglog("LOAD json ok", src.path)
+        return data
+    end
 end
 
 local function deleteProfile(name)
     local src = profileSourceMap[name]
-    if not src then return false end
-    pcall(function() if delfile then delfile(src.path) end end)
-    pcall(function() if delfile then delfile(PROFILE_FOLDER .. "/" .. name .. ".json") end end)
+    if not IO_OK.delfile then return false end
+    if src and src.path then pcall(delfile, src.path) end
+    -- Also nuke any stale alt-extension of the same name
+    pcall(delfile, PROFILE_FOLDER .. "/" .. name .. ".lua")
+    pcall(delfile, PROFILE_FOLDER .. "/" .. name .. ".json")
+    pcall(delfile, PROFILE_FOLDER .. "\\" .. name .. ".lua")
+    pcall(delfile, PROFILE_FOLDER .. "\\" .. name .. ".json")
+    profileSourceMap[name] = nil
     return true
 end
 
--- ── State ───────────────────────────────────
+local function sanitizeProfileName(t)
+    if t == nil then return nil end
+    t = tostring(t):gsub('[/\\:*?"<>|]', ""):gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 40)
+    if t == "" then return nil end
+    return t
+end
+
+-- Runtime config mirror — source of truth for save/load and combat reads
 local CFG = {
-    Enabled=true,AutoDodge=true,AutoBoxingM2=true,MultiTarget=true,AutoTargetNearest=true,
-    CycleRange=20,APRange=11,ParryOffset=0,ParryHold=0.27,ParryWindow=0.20,AutoHeight=true,HeightInfluence=1,
-    PingCompensate=true,ProbabilityToParry=100,
-    Debug=false,APKeybind="g",
-    SoundOnParry=false,
-    RhythmAutoHit=false,
-    AntiAFK=false, AFKInterval=240,
-    AutoRespawn=false, RespawnDelay=1.5,
-    TargetFacingYou=false, YouFacingTarget=true,
-    FacingThreshold=0.1,  -- source constant, hard-locked (no UI exposure)
-    -- Tech pack
-    AntiFeint=false,
-    CritDefense=false,
-    WCFakeWiff=false, WCFakeWiffTime=0.18,
-    ShadowStep=false, ShadowCrit=false,
+    AutoParry = true,
+    AutoDodge = true,
+    AutoBoxingM2 = true,  -- Syndicatus: AP runs block→dodge on Boxing M2
+    AutoTargetNearest = false,
+    MultiTarget = true,
+    HeightMultiplier = false,
+    TargetFacingYou = false,
+    YouFacingTarget = true,
+    DebugParry = false,
+    PingCompensate = true,
+    AutoPlay = true,
+    IncludeLocalCharacter = false,
+    APKeybind = "g",
+    MenuKey = "p",  -- INS menu open/close (changeable via keybind pill)
 }
 
-local ParryKey = string.byte("F")
-local DodgeKey = string.byte("Q")
+-- Early local so UI callbacks + profile load share the same binding
+local IncludeLocalCharacter = false
 
--- ── Ping ────────────────────────────────────
-local function GetPingValue()
-    -- returns ms
+-- CRITICAL: toggle handles MUST be declared BEFORE collect/apply.
+-- Lua local scope starts at the `local` line. If AutoParryToggle is
+-- declared later, applySettingsSnapshot closes over the GLOBAL (nil)
+-- while CreateAPSection assigns the local — load never updates the UI.
+-- Syndicatus avoids this with UIRefs.Armed = toggle (table field).
+local AutoParryToggle, AutoDodgeToggle
+local AutoTargetNearest, MultiTarget
+local TargetFacingYou, YouFacingTarget
+local ParryDebugToggle
+local PingCompensateToggle
+local AutoPlayToggle
+local HeightToggle
+local MenuKeybindRef = nil  -- INS Keybind handle for menu toggle
+
+-- INS UI stores the real value on handle.item.value (checkbox / slider).
+-- handle:Get() and handle:Set(v) close over that same item. Writing item
+-- directly is the reliable path — same library Syndicatus uses.
+local function safeToggleGet(toggle, fallback)
+    if not toggle then return fallback end
     local ok, v = pcall(function()
-        local item = StatsSvc.Network.ServerStatsItem["Data Ping"]
-        return item and item:GetValue()
+        if type(toggle.item) == "table" and type(toggle.item.value) == "boolean" then
+            return toggle.item.value
+        end
+        if type(toggle.Get) == "function" then return toggle:Get() end
+        return nil
     end)
-    if ok and type(v) == "number" then return v end
-    ok, v = pcall(function()
-        return LocalPlayer:GetNetworkPing() * 1000
+    if ok and type(v) == "boolean" then return v end
+    return fallback
+end
+
+local function safeToggleSet(toggle, value)
+    if not toggle then return end
+    -- INS checkbox coerces with (value == true) — match that exactly
+    value = (value == true)
+
+    -- 1) Write internal item (what the UI actually draws from)
+    pcall(function()
+        if type(toggle.item) == "table" then
+            toggle.item.value = value
+            if type(toggle.item.callback) == "function" then
+                toggle.item.callback(value)
+            end
+        end
     end)
-    if ok and type(v) == "number" then return v end
-    return 50
+
+    -- 2) Official API (fires callback only if value changed)
+    pcall(function()
+        if type(toggle.Set) == "function" then toggle:Set(value) end
+    end)
 end
 
--- 10Hz cache — refreshed on Heartbeat tick below
-local CachedPing = GetPingValue()
-local lastPingUpdate = 0
-local function GetCachedPing()
-    return CachedPing
+local function safeSliderSet(slider, value)
+    if not slider then return end
+    value = tonumber(value)
+    if not value then return end
+    pcall(function()
+        if type(slider.item) == "table" then
+            slider.item.value = value
+            if type(slider.item.callback) == "function" then
+                slider.item.callback(value)
+            end
+        end
+    end)
+    pcall(function()
+        if type(slider.Set) == "function" then slider:Set(value) end
+    end)
 end
 
--- Ping jitter ring buffer: 20 samples @ 10Hz = 2s rolling window
-local PING_SAMPLE_COUNT = 20
-local pingSamples = table.create(PING_SAMPLE_COUNT, CachedPing)
-local pingSampleIdx = 1
-local pingJitter = 0  -- ms, max-min over window
 
--- Movement bias (horizontal velocity-driven early-fire)
--- > 20 studs/s (sprint): -15ms. > 8 studs/s (walk): -8ms. Else 0.
-local cachedMovementBias = 0
-
--- Height cache (weak-keyed per character — GC drops dead chars automatically)
--- BodyHeightScale is set at spawn and does not change mid-fight in FFTM-style games.
-local heightCache = setmetatable({}, {__mode = "k"})
-local function heightScale(character)
-    if not character then return 1 end
-    local cached = heightCache[character]
-    if cached then return cached end
-    local hum = character:FindFirstChildWhichIsA("Humanoid")
-    if not hum then return 1 end
-    local scale = hum:FindFirstChild("BodyHeightScale")
-    local v = (scale and tonumber(scale.Value)) or 1
-    heightCache[character] = v
-    return v
+local function normalizeMenuKey(key)
+    if key == nil then return nil end
+    if type(key) == "table" then
+        key = key.value or key.Name or key.Key or key[1]
+    end
+    local s = string.lower(tostring(key or ""))
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" or s == "none" or s == "nil" then return nil end
+    -- Enum.KeyCode.P style
+    s = s:gsub("^enum%.keycode%.", "")
+    return s
 end
 
-local function IsHeavy(cfg)
-    return cfg.Heavy
-        or cfg.DisplayName == "M2"
-        or cfg.DisplayName == "Heavy"
-        or (tostring(cfg.DisplayName or ""):find("M2") ~= nil)
+local function readMenuKey()
+    local k = nil
+    pcall(function()
+        if MenuKeybindRef and type(MenuKeybindRef.item) == "table" then
+            k = MenuKeybindRef.item.value
+        elseif MenuKeybindRef and type(MenuKeybindRef.Get) == "function" then
+            k = MenuKeybindRef:Get()
+        end
+    end)
+    k = normalizeMenuKey(k)
+    if k then
+        CFG.MenuKey = k
+        return k
+    end
+    return tostring(CFG.MenuKey or "p")
 end
 
--- ── AP core — ported from lolbeans67 (identical timing / fire path) ──
-local ParryState = {
-    IDLE = "idle",
-    INPUT_PENDING = "input_pending",
-    PARRYING = "parrying",
-    STUNNED = "stunned",
+local function writeMenuKey(key)
+    local s = normalizeMenuKey(key) or "p"
+    CFG.MenuKey = s
+    pcall(function()
+        if UI_Library and UI_Library.SetMenuKey then
+            UI_Library:SetMenuKey(s)
+        end
+    end)
+    pcall(function()
+        if MenuKeybindRef and type(MenuKeybindRef.item) == "table" then
+            MenuKeybindRef.item.value = s
+        end
+        if MenuKeybindRef and type(MenuKeybindRef.Set) == "function" then
+            MenuKeybindRef:Set(s)
+        end
+    end)
+    return s
+end
+
+local function readAPKeybind()
+    local k = nil
+    pcall(function()
+        -- INS stores keybind on toggle.item.keybind.value (not .Bind)
+        if AutoParryToggle and type(AutoParryToggle.item) == "table"
+            and type(AutoParryToggle.item.keybind) == "table"
+            and type(AutoParryToggle.item.keybind.value) == "string" then
+            k = AutoParryToggle.item.keybind.value
+        elseif AutoParryToggle and AutoParryToggle.keyHandle and AutoParryToggle.keyHandle.keybind then
+            k = AutoParryToggle.keyHandle.keybind.value
+        end
+    end)
+    if type(k) == "string" and #k > 0 and k ~= "none" then
+        CFG.APKeybind = string.lower(k)
+        return CFG.APKeybind
+    end
+    return tostring(CFG.APKeybind or "g")
+end
+
+local function writeAPKeybind(key)
+    if not key or key == "" then return end
+    local s = tostring(key):gsub("%s+", ""):lower()
+    if s == "" then return end
+    CFG.APKeybind = s
+    pcall(function()
+        if AutoParryToggle and type(AutoParryToggle.item) == "table"
+            and type(AutoParryToggle.item.keybind) == "table" then
+            AutoParryToggle.item.keybind.value = s
+            AutoParryToggle.item.keybind.mode = "Toggle"
+        elseif AutoParryToggle and type(AutoParryToggle.AddKeybind) == "function" then
+            AutoParryToggle:AddKeybind(s, "Toggle")
+        end
+    end)
+end
+
+-- Filled after UI is built so Save/Load can sync widgets
+local UISettingRefs = {
+    RangeSlider = nil,
+    ProbabilitySlider = nil,
+    OffsetSlider = nil,
+    WindowSlider = nil,
+    CycleRangeSlider = nil,
+    HpRangeSlider = nil,
+    TargetMarkerToggle = nil,
+    OpponentHpToggle = nil,
+    PersonalHpToggle = nil,
+    CombatEspToggle = nil,
+    AnimDebugEspToggle = nil,
+    IncludeLocalToggle = nil,
 }
-local CurrentParryState = ParryState.IDLE
-local KeyHeld = false
-local ReleaseDeadline = 0
-local LocalStunned = false
-local LocalParrying = false
-local InputRegisteredTime = nil
-local ParryRegisteredTime = nil
-local LastPendingRegData = nil
-local AnimationRegistry = {}
-local ConstLatency = 0.018
-local EXECUTE_DEBOUNCE = 0.5
-local parryCount = 0
-local menuOpen = true
 
-local function TransitionToState(s)
-    CurrentParryState = s
+local function collectSettingsSnapshot()
+    -- Sync CFG from live widgets before serializing
+    if AutoParryToggle then CFG.AutoParry = safeToggleGet(AutoParryToggle, CFG.AutoParry) end
+    if AutoDodgeToggle then CFG.AutoDodge = safeToggleGet(AutoDodgeToggle, CFG.AutoDodge) end
+    if AutoTargetNearest then CFG.AutoTargetNearest = safeToggleGet(AutoTargetNearest, CFG.AutoTargetNearest) end
+    if MultiTarget then CFG.MultiTarget = safeToggleGet(MultiTarget, CFG.MultiTarget) end
+    if HeightToggle then CFG.HeightMultiplier = safeToggleGet(HeightToggle, CFG.HeightMultiplier) end
+    if TargetFacingYou then CFG.TargetFacingYou = safeToggleGet(TargetFacingYou, CFG.TargetFacingYou) end
+    if YouFacingTarget then CFG.YouFacingTarget = safeToggleGet(YouFacingTarget, CFG.YouFacingTarget) end
+    if ParryDebugToggle then CFG.DebugParry = safeToggleGet(ParryDebugToggle, CFG.DebugParry) end
+    if PingCompensateToggle then CFG.PingCompensate = safeToggleGet(PingCompensateToggle, CFG.PingCompensate) end
+    if AutoPlayToggle then CFG.AutoPlay = safeToggleGet(AutoPlayToggle, CFG.AutoPlay) end
+    readAPKeybind()
+    readMenuKey()
+
+    return {
+        AutoParry = CFG.AutoParry and true or false,
+        AutoDodge = CFG.AutoDodge and true or false,
+        AutoBoxingM2 = CFG.AutoBoxingM2 and true or false,
+        AutoTargetNearest = CFG.AutoTargetNearest and true or false,
+        MultiTarget = CFG.MultiTarget and true or false,
+        HeightMultiplier = CFG.HeightMultiplier and true or false,
+        TargetFacingYou = CFG.TargetFacingYou and true or false,
+        YouFacingTarget = CFG.YouFacingTarget and true or false,
+        DebugParry = CFG.DebugParry and true or false,
+        PingCompensate = CFG.PingCompensate and true or false,
+        AutoPlay = CFG.AutoPlay and true or false,
+        APKeybind = CFG.APKeybind,
+        MenuKey = CFG.MenuKey,
+        TargetMarker = NoCrashState.TargetMarkerEnabled and true or false,
+        OpponentHp = NoCrashState.OpponentHpEnabled and true or false,
+        PersonalHp = NoCrashState.PersonalHpEnabled and true or false,
+        CombatEsp = NoCrashState.CombatEspEnabled and true or false,
+        AnimDebugEsp = NoCrashState.AnimDebugEspEnabled and true or false,
+        HpViewRange = NoCrashState.HpViewRange,
+        AutoParryRange = AutoParryRange,
+        MaxCycleRange = MaxCycleRange,
+        ParryWindow = ParryWindow,
+        ProbabilityToParry = ProbabilityToParry,
+        DefaultReactionTime = DefaultReactionTime,
+        ParryOffset = ParryOffset,
+        BlockHoldTime = BlockHoldTime,
+        SelectedFolder = SelectedFolder,
+        IncludeLocalCharacter = IncludeLocalCharacter and true or false,
+        Enabled = CFG.AutoParry and true or false,
+        OpponentHpEnabled = NoCrashState.OpponentHpEnabled and true or false,
+        PersonalHpEnabled = NoCrashState.PersonalHpEnabled and true or false,
+        TargetMarkerEnabled = NoCrashState.TargetMarkerEnabled and true or false,
+        CombatEspEnabled = NoCrashState.CombatEspEnabled and true or false,
+        AnimDebugEspEnabled = NoCrashState.AnimDebugEspEnabled and true or false,
+    }
 end
 
--- Source: ReleaseDeadline = StartTime + HoldFor  (NOT os.clock() + hold)
-function BlockStart(StartTime, HoldFor)
-    if not StartTime then return end
-    if not CFG.Enabled then return end
-    if LocalStunned then return end
-
-    if CurrentParryState ~= ParryState.IDLE then
-        TransitionToState(ParryState.IDLE)
+local function collectTimingsSnapshot()
+    local t = {}
+    for id, info in pairs(GameConfig) do
+        t[id] = info.ReactionTime or DefaultReactionTime
     end
+    return t
+end
 
-    -- Edge-trigger fix: if F is already held from a previous fire, release it first.
-    -- Many parry systems are edge-triggered — a held key doesn't retrigger a parry
-    -- input. Mid-combo chains (where the next M1 lands before ReleaseDeadline) were
-    -- getting dropped silently. Release + press forces distinct InputBegan events
-    -- so each attack gets its own parry attempt registered.
-    if KeyHeld then
-        pcall(function() keyrelease(ParryKey) end)
+local function refreshTimingSliders()
+    -- After profile load/reset: rebind the open style so slot values match GameConfig
+    if bindStyle and currentStyleEditName then
+        pcall(function() bindStyle(currentStyleEditName) end)
+        return
     end
-
-    local hold = HoldFor or CFG.ParryHold or 0.27
-    ReleaseDeadline = StartTime + hold
-    KeyHeld = true
-    InputRegisteredTime = os.clock()
-    TransitionToState(ParryState.INPUT_PENDING)
-    pcall(function() keypress(ParryKey) end)
-end
-
-function BlockEnd()
-    KeyHeld = false
-    TransitionToState(ParryState.IDLE)
-    pcall(function() keyrelease(ParryKey) end)
-end
-
-function Dodge(force)
-    if not force and not CFG.AutoDodge then return end
-    BlockEnd()
-    pcall(function()
-        for _ = 1, 12 do
-            keypress(DodgeKey)
-            keyrelease(DodgeKey)
+    for animationId, slider in pairs(AnimationIdSliders) do
+        local info = GameConfig[animationId]
+        if info and slider and slider.Set then
+            pcall(function()
+                slider:Set(info.ReactionTime or DefaultReactionTime)
+            end)
         end
-    end)
+    end
 end
 
--- ── Shadow Step / Shadow Crit ──
--- Rapid simultaneous F+Q taps. Z = Shadow Step, B = Shadow Crit (separately gated).
-local function doShadowSequence()
-    pcall(function()
-        for _ = 1, 3 do
-            keypress(ParryKey)
-            keypress(DodgeKey)
-            task.wait(0.02)
-            keyrelease(ParryKey)
-            keyrelease(DodgeKey)
-            task.wait(0.02)
+local function applySettingsSnapshot(s)
+    if type(s) ~= "table" then return end
+
+    local function bool(v)
+        if v == nil then return nil end
+        return v and true or false
+    end
+
+    -- Accept both our keys and Syndicatus "Enabled"
+    local autoParry = s.AutoParry
+    if autoParry == nil then autoParry = s.Enabled end
+    if autoParry ~= nil then
+        CFG.AutoParry = bool(autoParry)
+        safeToggleSet(AutoParryToggle, CFG.AutoParry)
+    end
+    if s.AutoDodge ~= nil then
+        CFG.AutoDodge = bool(s.AutoDodge)
+        safeToggleSet(AutoDodgeToggle, CFG.AutoDodge)
+    end
+    if s.AutoBoxingM2 ~= nil then
+        CFG.AutoBoxingM2 = bool(s.AutoBoxingM2)
+        safeToggleSet(UISettingRefs.AutoBoxingM2Toggle, CFG.AutoBoxingM2)
+    end
+    if s.AutoTargetNearest ~= nil then
+        CFG.AutoTargetNearest = bool(s.AutoTargetNearest)
+        safeToggleSet(AutoTargetNearest, CFG.AutoTargetNearest)
+    end
+    if s.MultiTarget ~= nil then
+        CFG.MultiTarget = bool(s.MultiTarget)
+        safeToggleSet(MultiTarget, CFG.MultiTarget)
+    end
+    if s.HeightMultiplier ~= nil or s.AutoHeight ~= nil then
+        local hv = s.HeightMultiplier
+        if hv == nil then hv = s.AutoHeight end
+        CFG.HeightMultiplier = bool(hv)
+        safeToggleSet(HeightToggle, CFG.HeightMultiplier)
+    end
+    if s.TargetFacingYou ~= nil then
+        CFG.TargetFacingYou = bool(s.TargetFacingYou)
+        safeToggleSet(TargetFacingYou, CFG.TargetFacingYou)
+    end
+    if s.YouFacingTarget ~= nil then
+        CFG.YouFacingTarget = bool(s.YouFacingTarget)
+        safeToggleSet(YouFacingTarget, CFG.YouFacingTarget)
+    end
+    if s.DebugParry ~= nil or s.Debug ~= nil then
+        local dv = s.DebugParry
+        if dv == nil then dv = s.Debug end
+        CFG.DebugParry = bool(dv)
+        safeToggleSet(ParryDebugToggle, CFG.DebugParry)
+    end
+    if s.PingCompensate ~= nil then
+        CFG.PingCompensate = bool(s.PingCompensate)
+        safeToggleSet(PingCompensateToggle, CFG.PingCompensate)
+    end
+    if s.AutoPlay ~= nil or s.RhythmAutoHit ~= nil then
+        local av = s.AutoPlay
+        if av == nil then av = s.RhythmAutoHit end
+        CFG.AutoPlay = bool(av)
+        safeToggleSet(AutoPlayToggle, CFG.AutoPlay)
+    end
+    if s.APKeybind ~= nil then
+        writeAPKeybind(s.APKeybind)
+    end
+    if s.MenuKey ~= nil then
+        writeMenuKey(s.MenuKey)
+    end
+
+    if s.AutoParryRange ~= nil or s.APRange ~= nil then
+        AutoParryRange = tonumber(s.AutoParryRange or s.APRange) or AutoParryRange
+        safeSliderSet(UISettingRefs.RangeSlider, AutoParryRange)
+    end
+    if s.MaxCycleRange ~= nil or s.CycleRange ~= nil then
+        MaxCycleRange = tonumber(s.MaxCycleRange or s.CycleRange) or MaxCycleRange
+        safeSliderSet(UISettingRefs.CycleRangeSlider, MaxCycleRange)
+    end
+    if s.ParryWindow ~= nil then
+        ParryWindow = tonumber(s.ParryWindow) or ParryWindow
+        safeSliderSet(UISettingRefs.WindowSlider, ParryWindow)
+    end
+    if s.ProbabilityToParry ~= nil then
+        ProbabilityToParry = tonumber(s.ProbabilityToParry) or ProbabilityToParry
+        safeSliderSet(UISettingRefs.ProbabilitySlider, ProbabilityToParry)
+    end
+    if s.ParryOffset ~= nil then
+        ParryOffset = tonumber(s.ParryOffset) or ParryOffset
+        safeSliderSet(UISettingRefs.OffsetSlider, ParryOffset)
+    end
+    if s.DefaultReactionTime ~= nil or s.DefaultRT ~= nil then
+        DefaultReactionTime = tonumber(s.DefaultReactionTime or s.DefaultRT) or DefaultReactionTime
+    end
+    if s.BlockHoldTime ~= nil or s.ParryHold ~= nil then
+        BlockHoldTime = tonumber(s.BlockHoldTime or s.ParryHold) or BlockHoldTime
+    end
+    if s.SelectedFolder ~= nil then
+        SelectedFolder = s.SelectedFolder
+    end
+    if s.IncludeLocalCharacter ~= nil then
+        IncludeLocalCharacter = bool(s.IncludeLocalCharacter)
+        CFG.IncludeLocalCharacter = IncludeLocalCharacter
+        safeToggleSet(UISettingRefs.IncludeLocalToggle, IncludeLocalCharacter)
+    end
+
+    local function pickBool(...)
+        for i = 1, select("#", ...) do
+            local v = select(i, ...)
+            if v ~= nil then return bool(v) end
         end
-    end)
+        return nil
+    end
+
+    local tm = pickBool(s.TargetMarker, s.TargetMarkerEnabled)
+    if tm ~= nil then
+        NoCrashState.TargetMarkerEnabled = tm
+        safeToggleSet(UISettingRefs.TargetMarkerToggle, tm)
+    end
+    local oh = pickBool(s.OpponentHp, s.OpponentHpEnabled)
+    if oh ~= nil then
+        NoCrashState.OpponentHpEnabled = oh
+        safeToggleSet(UISettingRefs.OpponentHpToggle, oh)
+    end
+    local ph = pickBool(s.PersonalHp, s.PersonalHpEnabled)
+    if ph ~= nil then
+        NoCrashState.PersonalHpEnabled = ph
+        safeToggleSet(UISettingRefs.PersonalHpToggle, ph)
+    end
+    local ce = pickBool(s.CombatEsp, s.CombatEspEnabled)
+    if ce ~= nil then
+        NoCrashState.CombatEspEnabled = ce
+        safeToggleSet(UISettingRefs.CombatEspToggle, ce)
+    end
+    local ad = pickBool(s.AnimDebugEsp, s.AnimDebugEspEnabled)
+    if ad ~= nil then
+        NoCrashState.AnimDebugEspEnabled = ad
+        safeToggleSet(UISettingRefs.AnimDebugEspToggle, ad)
+    end
+    if s.HpViewRange ~= nil then
+        NoCrashState.HpViewRange = tonumber(s.HpViewRange) or NoCrashState.HpViewRange
+        safeSliderSet(UISettingRefs.HpRangeSlider, NoCrashState.HpViewRange)
+    end
 end
 
--- ── Wing Chun Fake Wiff ──
--- WC M2 is a counter — it whiffs if your M1 doesn't connect during their windup.
--- Rotate away briefly, fire M1 into empty air, restore facing. One-shot per registry entry.
-local WCFakeWiffActive = false
-local function doWCFakeWiff(targetChar)
-    if WCFakeWiffActive then return end
-    WCFakeWiffActive = true
-    task.spawn(function()
-        local ok = pcall(function()
-            local char = LocalPlayer.Character
-            if not char then return end
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            if not hrp then return end
-            local targetHrp = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
-            if not targetHrp then return end
-
-            local origCFrame = hrp.CFrame
-            local awayDir = (hrp.Position - targetHrp.Position)
-            if awayDir.Magnitude < 0.01 then return end
-            awayDir = awayDir.Unit
-            hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + awayDir * 10)
-
-            if mouse1click then mouse1click() end
-
-            task.wait(tonumber(CFG.WCFakeWiffTime) or 0.18)
-
-            local lookTarget = hrp.Position + origCFrame.LookVector * 10
-            hrp.CFrame = CFrame.new(hrp.Position, lookTarget)
-        end)
-        if not ok and CFG.Debug then print("[Syndicatus] WC Fake Wiff failed") end
-        WCFakeWiffActive = false
-    end)
-end
-
--- ── Anti Feint state ──
--- Tracks the regData we last fired on so we can detect its early disappearance (feint).
-local AntiFeintTarget = nil
-local AntiFeintFireTime = 0
-
--- Exact source formula:
---   RT  -= half_ping (if ping comp)
---   adj = (RT * heightMul) + ParryOffset
---   ClockStart/End = StartTime + adj / adj+Window
-local function CalculateParryTiming(attackConfig, StartTime, Target)
-    local optimalReactionTime = attackConfig.ReactionTime or attackConfig.ParryTime or DefaultRT
-    local HeightMultiplier = 1
-    if CFG.AutoHeight then
-        local inf = tonumber(CFG.HeightInfluence) or 1
-        local s = heightScale(Target)
-        HeightMultiplier = 1 + (s - 1) * inf
-    end
-    if CFG.PingCompensate then
-        local CompValue = (GetCachedPing() / 1000) * 0.5
-        optimalReactionTime = optimalReactionTime - CompValue
-        if optimalReactionTime < 0 then optimalReactionTime = 0 end
-    end
-    -- Pull BlockStart earlier by jitterShift, extend window by 2 * jitterShift.
-    -- jitterShift grows with ping variance (>40ms range triggers), capped at 25ms shift / +50ms window.
-    local jitterShift = 0
-    if pingJitter > 40 then
-        jitterShift = math.min(0.025, (pingJitter - 40) / 4000)
-    end
-    local adjustedReactionTime = (optimalReactionTime * HeightMultiplier)
-        + (CFG.ParryOffset or 0)
-        + cachedMovementBias       -- velocity-driven early-fire while moving
-        - jitterShift              -- pull leading edge earlier under ping instability
-    local window = (tonumber(CFG.ParryWindow) or 0.20) + jitterShift * 2
-    local ClockStart = StartTime + adjustedReactionTime
-    local ClockEnd = StartTime + adjustedReactionTime + window
-    return ClockStart, ClockEnd
-end
-
-local function UpdateAnimationRegistry(animKey, animId, now, currentTrackTime, attackConfig, TargetCharacter)
-    if not AnimationRegistry[animKey] then
-        local adjustedNow = now - ConstLatency
-        local blockStart, blockExpire = CalculateParryTiming(attackConfig, adjustedNow, TargetCharacter)
-        AnimationRegistry[animKey] = {
-            StartTime = adjustedNow,
-            Processed = false,
-            CurrentClockTime = os.clock(),
-            CurrentTrackTime = currentTrackTime,
-            AnimationId = animId,
-            DidALoop = false,
-            BlockStart = blockStart,
-            BlockExpire = blockExpire,
-            RandomNum = math.random(1, 100),
-            LastExecuteTime = 0,
-            Target = TargetCharacter,  -- for post-fire death validation
-        }
-    end
-
-    local regData = AnimationRegistry[animKey]
-
-    -- Loop: TimePosition went backwards → re-arm
-    if regData.CurrentTrackTime and (currentTrackTime < regData.CurrentTrackTime) then
-        local blockStart, blockExpire = CalculateParryTiming(attackConfig, now - currentTrackTime, TargetCharacter)
-        regData.Processed = false
-        regData.DidALoop = true
-        regData.BlockStart = blockStart
-        regData.BlockExpire = blockExpire
-        regData.StartTime = now - ConstLatency
-        regData.RandomNum = math.random(1, 100)
-    end
-
-    regData.CurrentClockTime = os.clock()
-    regData.CurrentTrackTime = currentTrackTime
-    return regData
-end
-
--- Source: BlockStart(regData.BlockStart) — passes the ideal window start as StartTime
-local function ExecuteParry(regData, attackConfig)
-    local now = os.clock()
-    if (now - (regData.LastExecuteTime or 0)) < EXECUTE_DEBOUNCE then return end
-    regData.LastExecuteTime = now
-
-    if LocalStunned then return end
-    if not CFG.Enabled then return end
-
-    local isHeavy = IsHeavy(attackConfig)
-
-    -- ForceParry counters: always F
-    if attackConfig.ForceParry then
-        if LastPendingRegData ~= regData then
-            LastPendingRegData = regData
-            BlockStart(regData.BlockStart, CFG.ParryHold)
-            parryCount = parryCount + 1
-        elseif regData.DidALoop then
-            regData.DidALoop = false
-            BlockStart(regData.BlockStart, CFG.ParryHold)
-            parryCount = parryCount + 1
+local function applyTimingsSnapshot(timings)
+    if type(timings) ~= "table" then return 0 end
+    local n = 0
+    for id, rt in pairs(timings) do
+        local key = tostring(id)
+        if not key:find("rbxassetid://", 1, true) and not key:find("http://", 1, true) then
+            key = "rbxassetid://" .. key
         end
-        if CFG.Debug then
-            print("[Syndicatus AP ForceParry]", attackConfig.Style, attackConfig.DisplayName)
+        if GameConfig[key] then
+            GameConfig[key].ReactionTime = tonumber(rt) or DefaultReactionTime
+            n = n + 1
         end
+    end
+    refreshTimingSliders()
+    return n
+end
+
+local function resetTimingsToOriginal()
+    for id, rt in pairs(OriginalTimings) do
+        if GameConfig[id] then
+            GameConfig[id].ReactionTime = rt
+        end
+    end
+    refreshTimingSliders()
+end
+
+local function buildProfilePayload()
+    return {
+        Format = PROFILE_FORMAT,
+        Version = PROFILE_VERSION,
+        _format = "lolbeans67-ap-v1", -- legacy field, kept for backwards read
+        Name = currentProfileName,
+        Timings = collectTimingsSnapshot(),
+        Settings = collectSettingsSnapshot(),
+    }
+end
+
+-- Accept:
+--   { Format="SharinganConfig", Timings=..., Settings=... }  (us, Lua + JSON)
+--   { _format="lolbeans67-ap-v1", Timings=..., Settings=... }   (legacy JSON)
+--   { Format="GakuranTimingConfig", Timings=... }                (beerus)
+--   { Timings=..., Settings=... }                                (loose)
+--   bare settings table (very old)
+local function applyProfilePayload(data)
+    if type(data) ~= "table" then return 0, 0 end
+
+    local timings = data.Timings
+    local settings = data.Settings
+
+    -- Beerus / Gakuran: timings-only format
+    local fmt = tostring(data.Format or data._format or "")
+    local timingsOnly = fmt:find("Gakuran", 1, true) ~= nil
+                     or fmt:find("Timing", 1, true) ~= nil
+                     or (timings and settings == nil)
+
+    local tCount = applyTimingsSnapshot(timings)
+    local sCount = 0
+    if not timingsOnly then
+        local toApply = settings or data
+        applySettingsSnapshot(toApply)
+        if type(toApply) == "table" then
+            for _ in pairs(toApply) do sCount = sCount + 1 end
+        end
+    end
+
+    cfglog("APPLY", "fmt=" .. fmt, "timings=" .. tCount, "settings=" .. sCount,
+        "AutoDodge=" .. tostring(CFG.AutoDodge),
+        "AutoParry=" .. tostring(CFG.AutoParry))
+
+    return tCount, sCount
+end
+
+local function GetAllFoldersInWorkspace()
+    local Folders = {}
+
+    for _, Folder in game.Workspace:GetChildren() do  
+        if Folder.ClassName == "Folder" then
+            table.insert(Folders, Folder.Name)
+        end
+    end
+
+    return Folders
+end
+
+local function GetAllCharactersInFolder()
+    if not SelectedFolder then
+        UI_Library:Notify("ERROR", "Select a folder first")
+        return nil
+    end
+
+    local folder = workspace:FindFirstChild(SelectedFolder)
+    if not folder then
+        UI_Library:Notify("ERROR", "Select a folder first")
+        return nil
+    end
+
+    local characters = {}
+    local localChar = LocalPlayer.Character
+
+    for _, character in ipairs(folder:GetChildren()) do
+        if character.ClassName == "Model" and character:FindFirstChildWhichIsA("Humanoid") then
+            if not IncludeLocalCharacter and localChar and character == localChar then
+                continue
+            end
+            table.insert(characters, character)
+        end
+    end
+
+    return characters
+end
+
+local function SetClipboardLoggedCache()
+    local totalItems = #AnimationsLoggedOrder
+    if totalItems == 0 then
+        print("[Clipboard] Nothing logged to copy.")
         return
     end
 
-    if isHeavy then
-        -- Crit Defense: 50/50 F/Q on heavies, overrides AutoDodge when active
-        if CFG.CritDefense then
-            if math.random(1, 2) == 1 then
-                if LastPendingRegData ~= regData then
-                    LastPendingRegData = regData
-                    AntiFeintTarget = regData
-                    AntiFeintFireTime = now
-                    BlockStart(regData.BlockStart, CFG.ParryHold)
-                    parryCount = parryCount + 1
-                end
-            else
-                Dodge(true)
-                parryCount = parryCount + 1
-            end
-            if CFG.Debug then
-                print(string.format("[Syndicatus CritDefense] %s | %s",
-                    tostring(attackConfig.Style), tostring(attackConfig.DisplayName)))
-            end
-            return
-        end
-        if CFG.AutoDodge then
-            Dodge()
-            parryCount = parryCount + 1
-            return
+    local ids = {}
+    for i = 1, totalItems do
+        -- Extract only the numbers from the asset ID string
+        local numericId = tostring(AnimationsLoggedOrder[i]):match("%d+")
+        if numericId then
+            table.insert(ids, numericId)
         end
     end
 
-    -- Identical to source gate
-    if LastPendingRegData ~= regData then
-        LastPendingRegData = regData
-        -- Remember what we fired on so cleanup pass can detect early cancel (Anti Feint)
-        AntiFeintTarget = regData
-        AntiFeintFireTime = now
-        BlockStart(regData.BlockStart, CFG.ParryHold)
-        parryCount = parryCount + 1
-        if CFG.SoundOnParry then
-            pcall(function()
-                local s = Instance.new("Sound")
-                s.SoundId = "rbxassetid://6026984224"
-                s.Volume = 0.4
-                s.Parent = game:GetService("SoundService")
-                s:Play()
-                game:GetService("Debris"):AddItem(s, 2)
-            end)
-        end
-        if CFG.Debug then
-            print(string.format("[Syndicatus AP] Block [%s | %s]",
-                tostring(attackConfig.Style), tostring(attackConfig.DisplayName)))
-        end
-    elseif LastPendingRegData == regData then
-        if regData.DidALoop then
-            regData.DidALoop = false
-            AntiFeintTarget = regData
-            AntiFeintFireTime = now
-            BlockStart(regData.BlockStart, CFG.ParryHold)
-            parryCount = parryCount + 1
-        end
-    end
+    local clipboardString = table.concat(ids, ",")
+    
+    setclipboard(clipboardString)
+    print(string.format("[Clipboard] Successfully copied %d logged animation IDs!", #ids))
+    UI_Library:Notify("Clipboard", string.format("Successfully copied %d logged animation IDs!", #ids))
 end
 
--- ParryFunction (Boxing M2) — same window gate as source
-local function TryParryFunction(regData, attackConfig, character, animId)
-    if type(attackConfig.ParryFunction) ~= "function" then return false end
-
-    if attackConfig.BoxingM2 and not CFG.AutoBoxingM2 then
-        regData.Processed = true
-        return true
+local function SetClipboardIgnoreList()
+    if #AnimationsLoggedOrder == 0 then
+        print("[Clipboard] Nothing logged to copy.")
+        return
     end
 
+    local newlyAddedIds = {}
+
+    for animationId in pairs(AnimationsLoggedCache) do
+        local numericId = tonumber(string.match(tostring(animationId), "%d+"))
+        if numericId and not IgnoreIdSet[numericId] then
+            table.insert(IgnoreIds, numericId)
+            table.insert(newlyAddedIds, tostring(numericId))
+        end
+    end
+
+    RebuildIgnoreIdSet()
+
+    local outputstring = table.concat(newlyAddedIds, ", ")
+    setclipboard(outputstring)
+
+    print(string.format(
+        "[Clipboard] Copied %d NEW IDs! (Total historical ignored count is now: %d)",
+        #newlyAddedIds,
+        #IgnoreIds
+    ))
+end
+
+local function AnimationGrabber(Folder)
+    local OutputLines = {"{"}
+    
+    for _, Style in Folder:GetChildren() do
+        if not Style.Name:find("Anims") then continue end
+        
+        local styleAnimations = {}
+        
+        for _, Animation in Style:GetChildren() do              
+            if Animation.Name:find("M1") or Animation.Name:find("M2") then 
+                local AnimationIdPointer = memory_read("uintptr_t", Animation.Address + 192)
+                local AnimationId = memory_read("string", AnimationIdPointer) or ""
+                -- Format the individual animation entry
+                local animString = string.format('      ["%s"] = {\n          DisplayName = "%s"\n      }', AnimationId, Animation.Name)
+                table.insert(styleAnimations, animString)
+            end 
+        end
+        
+        if #styleAnimations > 0 then
+            table.insert(OutputLines, string.format('   ["%s"] = {', Style.Name))
+            table.insert(OutputLines, table.concat(styleAnimations, ",\n"))
+            table.insert(OutputLines, '   },')
+        end
+    end
+    
+    table.insert(OutputLines, "}")
+    
+    local Output = table.concat(OutputLines, "\n")
+    setclipboard(Output)
+    print(Output)
+end
+--AnimationGrabber(game.ReplicatedStorage.Animations.Combat)
+
+local function LiteGrabber(Folder)
+    local OutputLines = {}
+    for _, Animation in Folder:GetChildren() do              
+        local AnimationIdPointer = memory_read("uintptr_t", Animation.Address + 192)
+        local AnimationId = memory_read("string", AnimationIdPointer) or ""
+        local String = `Name: {Animation.Name} | Id: {AnimationId}`
+        table.insert(OutputLines, String)
+    end
+
+    local Output = table.concat(OutputLines, "\n")
+    setclipboard(Output)
+    print(Output)
+end
+--LiteGrabber(game.ReplicatedStorage.Animations.Combat.WingChunAnims)
+
+local function UpdateSliders(_oldReactionTime)
+    refreshTimingSliders()
+end
+
+local scheduler = {}
+local pendingTasks = {}
+
+function scheduler.delay(delayTime, callback)
+    table.insert(pendingTasks, {
+        executeAt = os.clock() + delayTime,
+        callback = callback
+    })
+end
+
+function scheduler.update()
+    local n = #pendingTasks
+    if n == 0 then return end
     local now = os.clock()
-    local rt = attackConfig.ReactionTime or attackConfig.ParryTime or DefaultRT
-    local window = tonumber(CFG.ParryWindow) or 0.20
-    if (now - regData.StartTime) <= (rt + window / 2) then
-        if CFG.Enabled then
-            pcall(function()
-                attackConfig.ParryFunction({
-                    RegistryData = regData,
-                    Mob = character,
-                    AnimationId = animId,
-                })
-            end)
+    for i = n, 1, -1 do
+        local task = pendingTasks[i]
+        if now >= task.executeAt then
+            table.remove(pendingTasks, i)
+            coroutine.wrap(task.callback)()
         end
-        return true
     end
-    return false
 end
 
--- ── AnimationTracker ─────────────────────────
-local AnimTrackerInst = nil
-if AnimationTracker and AnimationTracker.new then
-    -- matcha's .new takes a single IgnoreIds arg (dot-call, not colon)
-    local ok, inst = pcall(AnimationTracker.new, IgnoreIds)
-    if ok then AnimTrackerInst = inst end
-end
+-- ==========================================
 
--- Separate LocalTracker (lolbeans pattern): dedicated tracker for our own character.
--- Lets us hook AnimationAdded event for ZERO-LATENCY detection of our parry/stun anims.
--- Without this we polled at 60Hz (up to 16ms lag). With this, event fires the frame
--- the anim starts.
-local LocalTracker = nil
-if AnimationTracker and AnimationTracker.new then
-    local okL, instL = pcall(AnimationTracker.new, IgnoreIds)
-    if okL then LocalTracker = instL end
-end
+-- ==========================================
 
--- StunToken: token-based auto-reset of LocalStunned. Each stun bumps the token;
--- the scheduled recovery only fires if token still matches, so multi-hit stuns
--- naturally extend recovery time without stacked timers.
-local StunToken = 0
-local function markStunned(duration)
-    LocalStunned = true
-    StunToken = StunToken + 1
-    local myToken = StunToken
-    task.delay(duration or 0.4, function()
-        if myToken == StunToken then
-            LocalStunned = false
+-- ==========================================================
+-- UI WINDOW & TAB INITIALIZATION
+-- ==========================================================
+local UI_Window = UI_Library:CreateWindow({
+    title = "Sharingan",
+    size = Vector2.new(700, 580),
+    configFolder = "sharingan_ap",
+    opacity = 1,
+    menuKey = tostring(CFG.MenuKey or "p"),
+})
+
+-- Dark panels + red accent (match Syndicatus)
+pcall(function()
+    if UI_Library.SetOpacity then UI_Library:SetOpacity(1) end
+    if UI_Library.SetTheme then
+        UI_Library:SetTheme({ Background = Color3.fromRGB(0, 0, 0) })
+    end
+    if UI_Library.SetAccent then
+        UI_Library:SetAccent(Color3.fromRGB(210, 40, 40))
+    end
+end)
+
+-- Menu background image (from Syndicatus)
+local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/syndicatusAP/main/content.png"
+local function applyMenuBackground()
+    pcall(function()
+        if UI_Library and UI_Library.SetBackgroundImage then
+            UI_Library:SetBackgroundImage(BG_IMAGE_URL, 0.10, 1, 1)
         end
     end)
 end
+applyMenuBackground()
+task.defer(applyMenuBackground)
+task.delay(1.0, applyMenuBackground)
 
--- Event-driven local anim handler — fires the moment a new anim starts on us
-local function onLocalAnimationAdded(anim)
-    if not anim or not anim.AnimationId then return end
-    local animId = tostring(anim.AnimationId)
+local AP_Tab = UI_Window:Tab("Auto Parry", "eye")
+local Config_Tab = UI_Window:Tab("Style Configurations", "gauge")
 
-    -- Our parry stance activated → mark registered immediately (zero latency)
-    if animSetHas(ParryingAnimation, animId) then
-        LocalParrying = true
-        if CurrentParryState == ParryState.INPUT_PENDING then
-            TransitionToState(ParryState.PARRYING)
-            ParryRegisteredTime = os.clock()
-        end
+local Files_Section     = AP_Tab:Section("Files", "Left")
+local AutoplaySection     = AP_Tab:Section("Autoplay", "Left")
+local Config_Section    = AP_Tab:Section("Global Configuration", "Left")
+local ClipboardSection = AP_Tab:Section("Logging", "Left")
+
+local AP_Section        = AP_Tab:Section("Settings", "Right")
+local Folders_Section   = AP_Tab:Section("Folders", "Right")
+local Overlay_Section   = AP_Tab:Section("Target Overlay", "Right")
+
+-- ==========================================================
+-- STATE & UI ELEMENT REFERENCES
+-- ==========================================================
+local TargetPool_Text
+local LoggedText, IgnoredText
+
+-- Toggle handles declared early (with CFG helpers) — do not redeclare
+
+-- ==========================================================
+-- HELPER FUNCTIONS
+-- ==========================================================
+local function UpdateTargetPoolSection()
+    local characters = GetAllCharactersInFolder() 
+    local names = {}
+    
+    for i, character in ipairs(characters) do
+        table.insert(names, character.Name)
+        if i == 10 then 
+            table.insert(names, "... (too long)") 
+            break 
+        end 
     end
 
-    -- We got hit → stun with auto-recovery
-    if animSetHas(StunnedAnimation, animId) then
-        markStunned(0.4)
-    end
-
-    -- Parry resolved (success anim or fail anim) → reset to IDLE
-    if animSetHas(ParriedAnimation, animId) or animSetHas(ParryFailedAnimation, animId) then
-        if CurrentParryState ~= ParryState.IDLE then
-            TransitionToState(ParryState.IDLE)
-        end
-    end
-
-    -- NOTE: lolbeans ports a self-M1 lockout here (if GameConfig[animId] then OnStunned()).
-    -- Tested in v9.4.19: catastrophic for actively attacking players. Every M1 we throw
-    -- fires lockout for 0.5s; chained combos extend it continuously → AP permanently
-    -- disabled while attacking. Removed. Game-side priority handles the "F during swing"
-    -- case well enough — we don't need to over-protect from the client side.
+    local poolString = #names > 0 and table.concat(names, ", ") or "NO TARGETS FOUND"
+    TargetPool_Text:SetText("Target Pool: " .. poolString)
 end
 
-if LocalTracker then
-    SyndicatusState:AddConnection(LocalTracker.AnimationAdded:Connect(onLocalAnimationAdded))
-end
-
-local _animScratch = {}
-local function getAnims(character)
-    for i = #_animScratch, 1, -1 do _animScratch[i] = nil end
-    if not character or not AnimTrackerInst then return _animScratch end
-    if character.Parent == nil then return _animScratch end
-    local hrp = character:FindFirstChild("HumanoidRootPart")
-    if not hrp then return _animScratch end
-    local ok, tracks = pcall(function()
-        return AnimTrackerInst:Update(character)
-    end)
-    if not ok or type(tracks) ~= "table" then return _animScratch end
-    for i = 1, #tracks do
-        local t = tracks[i]
-        if t and t.AnimationId then
-            _animScratch[#_animScratch + 1] = {
-                id = tostring(t.AnimationId),
-                pos = tonumber(t.TimePosition) or 0,
-            }
-        end
+local function UpdateClipboardSection()
+    local animationsLoggedCount = 0 
+    for _ in pairs(AnimationsLoggedCache or {}) do  
+        animationsLoggedCount += 1
     end
-    return _animScratch
+
+    LoggedText:SetText("Logged Ids: " .. animationsLoggedCount)
+    IgnoredText:SetText("Ignored Ids: " .. #(IgnoreIds or {}))
 end
 
--- ── Rhythm Auto-Hit ───────
--- Hardcoded keys: 4-lane = Z X , .  |  2-lane = F J
---
--- v9.4.38 — Peak-tracked hold detection.
--- PRESS when |headY - recY| < Threshold. Classify per note by peak posDelta:
---   hold  (peak >= HOLD_PEAK)  → release when posDelta <= HOLD_DONE_POSDELTA
---                                 AND held >= HOLD_MIN_HELD (reason: hold-done)
---   tap   (peak <  HOLD_PEAK)  → lolbeans style: keypress + wait(0.05) + keyrelease
--- Swap guard: never swap off a live hold (peak >= HOLD_PEAK AND posDelta > HOLD_DONE_POSDELTA).
--- Despawn and SAFETY_HELD timeout remain as safety nets.
--- Peak is seeded from the note's posDelta at PRESS and refreshed each tick while held.
+
+-- ==========================================================
+
+-- Luau 200-local limit: UI + rhythm in nested scope
+local function __LB67_UIAndRhythm()
+-- ── Rhythm Auto-Hit (from Syndicatus, peak-tracked holds + crisp taps) ──
+-- 4-lane keys: Z X , .   |  2-lane keys: F J
 local Receptors = {
     Receptor1 = "Z",
     Receptor2 = "X",
@@ -1070,11 +1884,11 @@ local DebuggedNotes = {}
 local LastRhythmCache = 0
 local Threshold = 30
 local OFFSCREEN = 2500
-local HOLD_PEAK = 80           -- peak posDelta above baseline → classify as hold
-local HOLD_DONE_POSDELTA = 55  -- trail consumed when posDelta <= this
-local HOLD_MIN_HELD = 0.12     -- min seconds held before hold-done may fire
-local TAP_LEAVE = 15           -- |headY - recY| past this on a tap → tap-done
-local SAFETY_HELD = 10         -- stuck-key force release
+local HOLD_PEAK = 80
+local HOLD_DONE_POSDELTA = 55
+local HOLD_MIN_HELD = 0.12
+local TAP_LEAVE = 15
+local SAFETY_HELD = 10
 
 local function rhythmKeyByte(key)
     if not key then return nil end
@@ -1097,7 +1911,7 @@ local function forceReleaseLane(rName, reason)
     local note = HeldNotes[rName]
     if keyB then pcall(function() keyrelease(keyB) end) end
     if note then FinishedNotes[note] = true end
-    if CFG.Debug then
+    if CFG.DebugParry then
         local heldFor = os.clock() - (HeldPressTime[rName] or os.clock())
         print(string.format("[Rhythm] RELEASE lane=%s held=%.3fs (%s)", rName, heldFor, reason or "?"))
     end
@@ -1108,7 +1922,17 @@ local function forceReleaseLane(rName, reason)
     HeldPeakPosDelta[rName] = nil
 end
 
-local function RhythmAutoHitTick()
+function AutoPlayTask() -- global: called from MainLoop in combat scope
+    if not CFG.AutoPlay then
+        -- Only walk HeldNotes if something is actually held (common case: empty → free)
+        if next(HeldNotes) ~= nil then
+            for rName in pairs(HeldNotes) do
+                forceReleaseLane(rName, "disabled")
+            end
+        end
+        return
+    end
+
     local gui = LocalPlayer:FindFirstChild("PlayerGui")
     if not gui then return end
     local RhythmServiceUI = gui:FindFirstChild("RhythmServiceUI")
@@ -1139,6 +1963,8 @@ local function RhythmAutoHitTick()
         if count == 2 then
             Receptors.Receptor1 = "F"
             Receptors.Receptor2 = "J"
+            Receptors.Receptor3 = nil
+            Receptors.Receptor4 = nil
         else
             Receptors.Receptor1 = "Z"
             Receptors.Receptor2 = "X"
@@ -1147,6 +1973,7 @@ local function RhythmAutoHitTick()
         end
         table.clear(ReceptorXMap)
         for name, key in pairs(Receptors) do
+            if not key then continue end
             local rec = ReceptorLookup:FindFirstChild(name)
             if rec then
                 local rx
@@ -1162,7 +1989,7 @@ local function RhythmAutoHitTick()
     end
 
     local pressCandidate = {}
-    local laneCurState = {}  -- rName -> { headY, recY, posDelta } for the HeldNotes[rName] note, this tick
+    local laneCurState = {}
 
     for _, note in ipairs(Lanes:GetChildren()) do
         if note.Name ~= "NoteTemplate" then continue end
@@ -1201,7 +2028,7 @@ local function RhythmAutoHitTick()
             continue
         end
 
-        if CFG.Debug and not DebuggedNotes[note] then
+        if CFG.DebugParry and not DebuggedNotes[note] then
             if math.abs(headY - receptorPos.Y) < Threshold * 3 then
                 DebuggedNotes[note] = true
                 print(string.format(
@@ -1211,7 +2038,6 @@ local function RhythmAutoHitTick()
             end
         end
 
-        -- Held note on this lane: update peak + stash current geometry, never a press candidate
         if HeldNotes[rName] == note then
             if posDelta > (HeldPeakPosDelta[rName] or 0) then
                 HeldPeakPosDelta[rName] = posDelta
@@ -1230,16 +2056,13 @@ local function RhythmAutoHitTick()
         end
     end
 
-    -- Release pass
-    -- 1) Despawn: note gone from Lanes
+    -- Release: despawn
     for rName, heldNote in pairs(HeldNotes) do
         if not heldNote or not heldNote.Parent then
             forceReleaseLane(rName, "despawn")
         end
     end
-    -- 2) Classification-driven release + safety
-    --    HOLDS: hold-done when trail drains (peak path)
-    --    TAPS:  self-release inside the press spawn (lolbeans style) — no geometry release here
+    -- Release: hold-done / safety
     for rName, _ in pairs(HeldNotes) do
         local heldFor = now - (HeldPressTime[rName] or now)
         if heldFor > SAFETY_HELD then
@@ -1249,19 +2072,15 @@ local function RhythmAutoHitTick()
             if cur then
                 local peak = HeldPeakPosDelta[rName] or 0
                 if peak >= HOLD_PEAK then
-                    -- real hold: wait for trail to drain
                     if cur.posDelta <= HOLD_DONE_POSDELTA and heldFor >= HOLD_MIN_HELD then
                         forceReleaseLane(rName, "hold-done")
                     end
                 end
-                -- taps: do nothing here; 50ms self-release already ran at PRESS
             end
         end
     end
 
-    -- Press pass
-    -- TAP  (posDelta < HOLD_PEAK): lolbeans style — keypress, wait 0.05, keyrelease (once per note)
-    -- HOLD (posDelta >= HOLD_PEAK): hold key until hold-done / despawn; never swap mid-trail
+    -- Press: HOLD vs TAP
     for rName, cand in pairs(pressCandidate) do
         local note = cand.note
         if FinishedNotes[note] then continue end
@@ -1275,7 +2094,7 @@ local function RhythmAutoHitTick()
                 local cur = laneCurState[rName]
                 local activeHold = (peak >= HOLD_PEAK and cur and cur.posDelta > HOLD_DONE_POSDELTA)
                 if activeHold then
-                    continue  -- live hold still has trail
+                    continue
                 end
                 forceReleaseLane(rName, "swap")
             end
@@ -1286,31 +2105,30 @@ local function RhythmAutoHitTick()
             HeldPressTime[rName] = now
             HeldPeakPosDelta[rName] = cand.posDelta or 0
             pcall(function() keypress(cand.b) end)
-            if CFG.Debug then
+            if CFG.DebugParry then
                 print(string.format(
                     "[Rhythm] PRESS HOLD lane=%s headY=%.1f posDelta=%.1f",
                     rName, cand.headY, cand.posDelta or 0
                 ))
             end
         else
-            -- TAP: lolbeans AutoPlayTask path — crisp 50ms press, once per note instance
             if HeldKeys[rName] then
                 local peak = HeldPeakPosDelta[rName] or 0
                 local cur = laneCurState[rName]
                 if peak >= HOLD_PEAK and cur and cur.posDelta > HOLD_DONE_POSDELTA then
-                    continue  -- don't interrupt a live hold on this lane
+                    continue
                 end
                 forceReleaseLane(rName, "swap")
             end
 
-            FinishedNotes[note] = true  -- one shot — prevents multi-frame re-press spam
+            FinishedNotes[note] = true
             local b = cand.b
             task.spawn(function()
                 pcall(function() keypress(b) end)
                 task.wait(0.05)
                 pcall(function() keyrelease(b) end)
             end)
-            if CFG.Debug then
+            if CFG.DebugParry then
                 print(string.format(
                     "[Rhythm] PRESS TAP lane=%s headY=%.1f posDelta=%.1f",
                     rName, cand.headY, cand.posDelta or 0
@@ -1327,1803 +2145,2327 @@ local function RhythmAutoHitTick()
     end
 end
 
--- ── Targeting ───────────────────────────────
-local TargetCharacters = {}
-local function updateTargets(list)
-    table.clear(TargetCharacters)
-    for _, c in pairs(list) do
-        table.insert(TargetCharacters, c)
-    end
+-- Falling pieces are called note template
+-- Lanes are numbered
+
+-- ==========================================================
+-- SECTION BUILDERS
+-- ==========================================================
+
+local function CreateAutoPlaySection()
+    AutoplaySection:Info("Rhythm minigame auto-hit (Syndicatus). 4-lane: Z X , .  |  2-lane: F J")
+    AutoPlayToggle = AutoplaySection:Toggle("Rhythm Auto-Hit", CFG.AutoPlay, function(on)
+        CFG.AutoPlay = on and true or false
+        if not on then
+            -- release stuck keys immediately
+            pcall(function()
+                for rName in pairs(HeldNotes) do
+                    forceReleaseLane(rName, "toggle-off")
+                end
+            end)
+        end
+        pcall(function()
+            UI_Library:Notify("Rhythm", on and "Auto-Hit ON" or "Auto-Hit OFF")
+        end)
+    end)
+    AutoplaySection:Info("Turn ON only during the rhythm minigame. Works with holds + taps.")
 end
 
-local lastCycle = 0
-local debugLastPrint = 0
-local selectedConfig = "Default"
-local TargetLabel = nil
+-- 1. Auto Parry Settings Section
+local function CreateAPSection()
+    AP_Section:Label("You have to press X in order to target someone or turn on Auto Target Nearest")
 
--- Hoisted scratch buffers for cycleTargets (runs 2Hz on Heartbeat)
-local _candidates, _valid, _finals = {}, {}, {}
-local function _validSortAsc(a, b) return a.d < b.d end
-
-local function cycleTargets()
-    local lc = LocalPlayer.Character
-    local lr = lc and lc:FindFirstChild("HumanoidRootPart")
-    if not lr then updateTargets({}) return end
-    table.clear(_candidates)
+    AutoParryToggle = AP_Section:Toggle("Auto Parry", CFG.AutoParry, function(on)
+        CFG.AutoParry = on and true or false
+    end)
     pcall(function()
-        for _, p in pairs(PlayersSvc:GetPlayers()) do
-            if p ~= LocalPlayer and p.Character then
-                _candidates[#_candidates+1] = p.Character
-            end
+        AutoParryToggle:AddKeybind(tostring(CFG.APKeybind or "g"), "Toggle")
+    end)
+
+    -- Backup keybind mirror. INS-UI's AddKeybind may flip the toggle's visual
+    -- without firing the user callback (varies per executor), which strands
+    -- CFG.AutoParry. We mirror the toggle's visual state into CFG after the
+    -- press — covers all three cases:
+    --   INS fires callback      → CFG already set, mirror is a no-op
+    --   INS flips visual only   → mirror reads visual, writes CFG
+    --   INS does nothing        → mirror detects no change, flips CFG + visual
+    pcall(function()
+        if _G.__Lolbeans67AP_KeybindConn then
+            _G.__Lolbeans67AP_KeybindConn:Disconnect()
+            _G.__Lolbeans67AP_KeybindConn = nil
         end
     end)
-    table.clear(_valid)
-    for _, c in ipairs(_candidates) do
-        local tr = c:FindFirstChild("HumanoidRootPart")
-        local h  = c:FindFirstChildWhichIsA("Humanoid")
-        if tr and h and h.Health > 0 then
-            local d = (lr.Position-tr.Position).Magnitude
-            if d <= CFG.CycleRange then table.insert(_valid,{c=c,d=d}) end
-        end
-    end
-    table.sort(_valid, _validSortAsc)
-    table.clear(_finals)
-    if CFG.MultiTarget then
-        for i=1,math.min(3,#_valid) do table.insert(_finals,_valid[i].c) end
-    elseif CFG.AutoTargetNearest and #_valid > 0 then
-        table.insert(_finals, _valid[1].c)
-    elseif #_valid > 0 then
-        -- keep previous lock if still valid, else nearest
-        local prev = TargetCharacters[1]
-        local keep = false
-        if prev then
-            for _, v in ipairs(_valid) do
-                if v.c == prev then keep = true break end
+    _G.__Lolbeans67AP_KeybindConn = UIS.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local wanted = string.lower(tostring(CFG.APKeybind or "g"))
+        if string.lower(input.KeyCode.Name) ~= wanted then return end
+
+        local before = CFG.AutoParry and true or false
+        task.defer(function()
+            local v = safeToggleGet(AutoParryToggle, nil)
+            if type(v) == "boolean" and v ~= before then
+                CFG.AutoParry = v -- INS already flipped visual; mirror into CFG
+            else
+                -- INS didn't flip (or we can't read it) — do it ourselves
+                CFG.AutoParry = not before
+                safeToggleSet(AutoParryToggle, CFG.AutoParry)
             end
-        end
-        if keep then
-            table.insert(_finals, prev)
-        else
-            table.insert(_finals, _valid[1].c)
-        end
-    end
-    updateTargets(_finals)
-end
-
-local UnknownLog = {} local UnknownOrder = {}
-
--- ── Anti-AFK + Auto-Respawn state ───────────
-local lastAFKPing = 0
-local pendingRespawn = nil
-
-local function hookCharacter(character)
-    if not character then return end
-    local humanoid = character:FindFirstChildWhichIsA("Humanoid")
-    if not humanoid then
-        character.ChildAdded:Connect(function(child)
-            if child:IsA("Humanoid") then
-                child.Died:Connect(function()
-                    if CFG.AutoRespawn then
-                        pendingRespawn = os.clock()
-                    end
-                end)
+            if CONFIG_DEBUG then
+                print("[Config] AP keybind → CFG.AutoParry=", CFG.AutoParry)
             end
         end)
-        return
+    end)
+    NoCrashState:AddConnection(_G.__Lolbeans67AP_KeybindConn)
+
+    AutoDodgeToggle = AP_Section:Toggle("Auto Dodge", CFG.AutoDodge, function(on)
+        CFG.AutoDodge = on and true or false
+    end)
+    UISettingRefs.AutoBoxingM2Toggle = AP_Section:Toggle("Auto Boxing M2", CFG.AutoBoxingM2, function(on)
+        CFG.AutoBoxingM2 = on and true or false
+        pcall(function()
+            UI_Library:Notify(
+                "Boxing M2",
+                on and "AP runs block→dodge on Boxing M2" or "Manual — AP ignores Boxing M2"
+            )
+        end)
+    end)
+    AP_Section:Info("OFF = you parry/dodge Boxing M2 yourself. ON = AP block→dodge sequence.")
+    AutoTargetNearest = AP_Section:Toggle("Auto Target Nearest", CFG.AutoTargetNearest, function(on)
+        CFG.AutoTargetNearest = on and true or false
+    end)
+    MultiTarget = AP_Section:Toggle("Multiple Targets", CFG.MultiTarget, function(on)
+        CFG.MultiTarget = on and true or false
+    end)
+    HeightToggle = AP_Section:Toggle("Height Multiplier (May crash some users)", CFG.HeightMultiplier, function(on)
+        CFG.HeightMultiplier = on and true or false
+    end)
+
+    AP_Section:Divider("Conditions")
+
+    TargetFacingYou = AP_Section:Toggle("Target facing you", CFG.TargetFacingYou, function(on)
+        CFG.TargetFacingYou = on and true or false
+    end)
+    YouFacingTarget = AP_Section:Toggle("You facing target", CFG.YouFacingTarget, function(on)
+        CFG.YouFacingTarget = on and true or false
+    end)
+end
+
+-- Optional overlays stay off by default, so the combat base remains lightweight.
+local function CreateOverlaySection()
+    Overlay_Section:Label("Press X to cycle targets. Multiple Targets keeps the nearest three.")
+
+    UISettingRefs.TargetMarkerToggle = Overlay_Section:Toggle("X Target Marker", NoCrashState.TargetMarkerEnabled, function(on)
+        NoCrashState.TargetMarkerEnabled = on and true or false
+    end)
+
+    Overlay_Section:Divider("HP Display")
+    UISettingRefs.OpponentHpToggle = Overlay_Section:Toggle("Opponent HP Bars", NoCrashState.OpponentHpEnabled, function(on)
+        NoCrashState.OpponentHpEnabled = on and true or false
+    end)
+    UISettingRefs.PersonalHpToggle = Overlay_Section:Toggle("Personal HP Bar", NoCrashState.PersonalHpEnabled, function(on)
+        NoCrashState.PersonalHpEnabled = on and true or false
+    end)
+    local range = Overlay_Section:Slider("HP View Range", 75, 5, 15, 200, " studs", function(value)
+        NoCrashState.HpViewRange = value
+    end)
+    range:Set(NoCrashState.HpViewRange)
+    UISettingRefs.HpRangeSlider = range
+    Overlay_Section:Label("Compact name + HP only inside this range (no anim spam).")
+
+    Overlay_Section:Divider("Combat ESP")
+    UISettingRefs.CombatEspToggle = Overlay_Section:Toggle("Combat ESP (name / range)", NoCrashState.CombatEspEnabled, function(on)
+        NoCrashState.CombatEspEnabled = on and true or false
+        if UpdateTargetCharacters and TargetCharacters then
+            local list = {}
+            for _, c in ipairs(TargetCharacters) do table.insert(list, c) end
+            pcall(function() UpdateTargetCharacters(list) end)
+        end
+    end)
+    UISettingRefs.AnimDebugEspToggle = Overlay_Section:Toggle("Anim Debug ESP (IDs / timing)", NoCrashState.AnimDebugEspEnabled, function(on)
+        NoCrashState.AnimDebugEspEnabled = on and true or false
+        if on and not NoCrashState.CombatEspEnabled then
+            NoCrashState.CombatEspEnabled = true
+            safeToggleSet(UISettingRefs.CombatEspToggle, true)
+        end
+        if UpdateTargetCharacters and TargetCharacters then
+            local list = {}
+            for _, c in ipairs(TargetCharacters) do table.insert(list, c) end
+            pcall(function() UpdateTargetCharacters(list) end)
+        end
+    end)
+    Overlay_Section:Label("Anim Debug is the old noisy text (rbxassetid / timing / unknown). Keep OFF unless tuning.")
+end
+
+-- 2. Global Configurations Section
+local function CreateGlobalConfigSection()
+    ParryDebugToggle = Config_Section:Toggle("Debug Parry", CFG.DebugParry, function(on)
+        CFG.DebugParry = on and true or false
+    end)
+
+    
+    
+    local Range = Config_Section:Slider("Auto Parry Range", 40, 1, 7, 80, "", function(v)
+        AutoParryRange = v
+    end)
+    Range:Set(AutoParryRange)
+    UISettingRefs.RangeSlider = Range
+
+    local Probability = Config_Section:Slider("Probability To Parry", 100, 1, 1, 100, "%", function(v)
+        ProbabilityToParry = v
+    end)
+    Probability:Set(ProbabilityToParry)
+    UISettingRefs.ProbabilitySlider = Probability
+
+    local DefaultSection = Config_Tab:Section("Default Configuration", "Left")
+    
+    local Offset = DefaultSection:Slider("Parry offset", 0, 0.01, -0.1, 0.1, "s", function(v)
+        ParryOffset = v
+    end)
+    Offset:Set(ParryOffset)
+    UISettingRefs.OffsetSlider = Offset
+
+    DefaultSection:Label("Positive moves window forward (parry later), Negative moves it backward (parry earlier)")
+
+    PingCompensateToggle = DefaultSection:Toggle("Ping Compensation", CFG.PingCompensate, function(on)
+        CFG.PingCompensate = on and true or false
+    end)
+    DefaultSection:Label("Subtracts half of your ping value from the start time of ur reaction time. May improve performance.")
+    
+    DefaultSection:Divider("Window")
+    
+    local Window = DefaultSection:Slider("Default Parry Window", 0.3, 0.01, 0, 1, "", function(v)
+        ParryWindow = v
+    end)
+    Window:Set(ParryWindow)
+    UISettingRefs.WindowSlider = Window
+    DefaultSection:Label("This is usually constant, don't change this.")
+end
+
+-- 3. Folders Section
+local function CreateFoldersSection()
+    TargetPool_Text = Folders_Section:Label("Target Pool: NO TARGETS FOUND") 
+
+    local folders = GetAllFoldersInWorkspace()
+
+    local Range = Folders_Section:Slider("Max Cycle Range", 10, 1, 7, 50, "", function(v)
+        MaxCycleRange = v
+    end)
+    Range:Set(MaxCycleRange)
+    UISettingRefs.CycleRangeSlider = Range
+
+    UISettingRefs.IncludeLocalToggle = Folders_Section:Toggle("Include Local Character", CFG.IncludeLocalCharacter, function(on)
+        IncludeLocalCharacter = on and true or false
+        CFG.IncludeLocalCharacter = IncludeLocalCharacter
+        UpdateTargetPoolSection()
+    end)
+
+    local FolderCombo = Folders_Section:Dropdown("Live Folder", nil, folders, false, function(list)
+        SelectedFolder = list[1]
+        UpdateTargetPoolSection()
+    end)
+
+    if game.Workspace:FindFirstChild("Players") then  
+        FolderCombo:Set({"Players"})
+    elseif game.Workspace:FindFirstChild("Live") then 
+        FolderCombo:Set({"Live"})
     end
-    humanoid.Died:Connect(function()
-        if CFG.AutoRespawn then
-            pendingRespawn = os.clock()
+
+    print("[UI] Folders Section Created")
+end
+
+-- 4. Logging & Clipboard Section
+local function CreateClipboardSection()
+    LoggedText = ClipboardSection:Label("Logged Ids: ?")
+    IgnoredText = ClipboardSection:Label("Ignored Ids: ?")
+
+    local elements = {
+        {
+            Type = "Toggle",
+            Name = "Damage Logs",
+            Default = false,
+            Callback = function(on)
+                ToggleDamageLogger(on)
+            end
+        },
+        {
+            Type = "Toggle",
+            Name = "Add unknowns to ignore and copy ignore list",
+            Default = false,
+            Keybind = "v",
+            Callback = function(on, instance) 
+                SetClipboardIgnoreList()
+                AnimationsLoggedCache = {}
+                AnimationsLoggedOrder = {}
+                UpdateClipboardSection()
+            end
+        },
+        {
+            Type = "Toggle",
+            Name = "Copy to clipboard",
+            Keybind = "c",
+            Callback = function()
+                SetClipboardLoggedCache()
+            end
+        },
+        {
+            Type = "Toggle",
+            Name = "Clear animation cache",
+            Keybind = "k",
+            Callback = function()
+                AnimationsLoggedCache = {}
+                AnimationsLoggedOrder = {}
+                UpdateClipboardSection()
+            end
+        }
+    }
+
+    for _, config in ipairs(elements) do
+        local instance
+
+        if game.PlaceId == 128736949265057 then 
+            config.Type = "Button"
+        end
+
+        if config.Type == "Toggle" then
+            instance = ClipboardSection:Toggle(config.Name, config.Default, function(on)
+                if on then  
+                    config.Callback(on, instance)                    
+                end
+                instance:Set(false) 
+            end)
+
+            if config.Keybind then
+                instance:AddKeybind(config.Keybind, "Toggle")
+            end
+
+        elseif config.Type == "Button" then
+            instance = ClipboardSection:Button(config.Name, config.Callback)
+        end
+    end
+end
+
+-- 5. Profiles Section (Syndicatus-style multi-config)
+local function CreateFilesSection()
+    Files_Section:Info("Game: " .. tostring(GameName))
+    Files_Section:Info("Profiles save as .lua in " .. PROFILE_FOLDER .. "/  (legacy .json still read)")
+    Files_Section:Info("Type a name or select one → Save overwrites that profile.")
+
+    -- Menu open/close key — keep handle so save/load can read/write the pill
+    pcall(function()
+        MenuKeybindRef = Files_Section:Keybind(
+            "Menu Toggle Key",
+            tostring(CFG.MenuKey or "p"),
+            function(key)
+                local k = writeMenuKey(key)
+                pcall(function()
+                    UI_Library:Notify("Menu", "Toggle key → " .. tostring(k):upper())
+                end)
+            end
+        )
+    end)
+    Files_Section:Info("Click the key pill, press a key to rebind menu open/close. Saved with profiles.")
+
+    local NameLabel = Files_Section:Label("Will save as: " .. currentProfileName)
+    local ConfigListLabel = Files_Section:Label("Saved: (none)")
+    local ProfileDrop = nil
+    local _refreshingDrop = false
+
+    local function setSaveName(t, silent)
+        local n = sanitizeProfileName(t)
+        if not n then
+            if not silent then UI_Library:Notify("Profiles", "Invalid name") end
+            return false
+        end
+        currentProfileName = n
+        pcall(function() NameLabel:SetText("Will save as: " .. n) end)
+        return true
+    end
+
+    local function refreshDrop(preferName)
+        if _refreshingDrop then return end
+        _refreshingDrop = true
+        pcall(function()
+            local p = listProfiles()
+            -- Prefer explicit name (post-save), then current selection / label — never wipe to empty
+            local keep = preferName or selectedConfig or currentProfileName
+            if type(keep) ~= "string" or keep == "" then
+                keep = "Default"
+            end
+
+            if ProfileDrop then
+                pcall(function() ProfileDrop.Choices = p end)
+                pcall(function() if ProfileDrop.UpdateChoices then ProfileDrop:UpdateChoices(p) end end)
+                pcall(function() if ProfileDrop.Refresh then ProfileDrop:Refresh(p) end end)
+                pcall(function()
+                    if ProfileDrop.ClearChoices and ProfileDrop.AddChoice then
+                        ProfileDrop:ClearChoices()
+                        for _, n in ipairs(p) do ProfileDrop:AddChoice(n) end
+                    end
+                end)
+
+                local found = false
+                for _, n in ipairs(p) do
+                    if n == keep then found = true break end
+                end
+                -- Keep the name even if scan is briefly lagging; only fall back when keep is useless
+                if found then
+                    selectedConfig = keep
+                elseif keep ~= "Default" and keep ~= "" and keep ~= "none" then
+                    selectedConfig = keep  -- stay on saved name
+                else
+                    selectedConfig = p[1] or "Default"
+                end
+                currentProfileName = selectedConfig
+
+                pcall(function() ProfileDrop.Value = { selectedConfig } end)
+                pcall(function() if ProfileDrop.Set then ProfileDrop:Set(selectedConfig) end end)
+                pcall(function() if ProfileDrop.SetValue then ProfileDrop:SetValue(selectedConfig) end end)
+            end
+
+            pcall(function() NameLabel:SetText("Will save as: " .. tostring(selectedConfig)) end)
+            pcall(function()
+                if NameBox then
+                    if type(NameBox.item) == "table" then NameBox.item.value = selectedConfig end
+                    if type(NameBox.Set) == "function" then NameBox:Set(selectedConfig) end
+                end
+            end)
+
+            if ConfigListLabel then
+                local real = {}
+                for _, n in ipairs(p) do
+                    if profileSourceMap[n] then table.insert(real, n) end
+                end
+                local msg = (#real == 0) and "Saved: (none)" or ("Saved: " .. table.concat(real, " | "))
+                pcall(function() ConfigListLabel:SetText(msg) end)
+            end
+        end)
+        _refreshingDrop = false
+    end
+
+    -- Name input — INS Textbox(label, default, callback). Callback fires on commit.
+    local NameBox = nil
+    do
+        local ok, handle = pcall(function()
+            return Files_Section:Textbox("Config Name", tostring(currentProfileName or ""), function(t)
+                setSaveName(t, false)
+            end)
+        end)
+        if ok and handle then
+            NameBox = handle
+        else
+            Files_Section:Info("Textbox unavailable — type name via dropdown selection")
+        end
+    end
+
+    ProfileDrop = Files_Section:Dropdown("Load / Delete target", nil, listProfiles(), false, function(l)
+        if _refreshingDrop then return end
+        local s = l
+        if type(l) == "table" then
+            s = l[1] or l.Value or l.Selected or l.Name
+        end
+        if type(s) == "string" and #s > 0 then
+            selectedConfig = s
+            setSaveName(s, true)
+            -- Keep name box in sync with selection (avoids stale text on Save)
+            pcall(function()
+                if NameBox then
+                    if type(NameBox.item) == "table" then NameBox.item.value = s end
+                    if type(NameBox.Set) == "function" then NameBox:Set(s) end
+                end
+            end)
+        end
+    end)
+    pcall(function()
+        if ProfileDrop and ProfileDrop.SetRefresh then
+            ProfileDrop:SetRefresh(listProfiles)
+        end
+    end)
+
+    Files_Section:Button("Save Current", function()
+        -- Name priority (dropdown selection wins — don't let empty/stale textbox wipe it):
+        -- 1) selectedConfig if real
+        -- 2) currentProfileName
+        -- 3) Config Name textbox (only if non-empty and not "none")
+        local function isUsefulName(s)
+            if type(s) ~= "string" then return false end
+            local t = s:match("^%s*(.-)%s*$") or ""
+            if t == "" or t:lower() == "none" or t:lower() == "nil" then return false end
+            return true
+        end
+
+        local name = nil
+        if isUsefulName(selectedConfig) and selectedConfig ~= "Default" then
+            name = sanitizeProfileName(selectedConfig)
+        end
+        if not name and isUsefulName(currentProfileName) then
+            name = sanitizeProfileName(currentProfileName)
+        end
+        if not name then
+            pcall(function()
+                if NameBox then
+                    local t = nil
+                    if type(NameBox.item) == "table" then t = NameBox.item.value end
+                    if (not t or t == "") and type(NameBox.Get) == "function" then t = NameBox:Get() end
+                    if isUsefulName(t) then name = sanitizeProfileName(t) end
+                end
+            end)
+        end
+        if not name and selectedConfig == "Default" then
+            name = "Default"
+        end
+        if not name then
+            UI_Library:Notify("Profiles", "Type a config name, or pick one in the dropdown")
+            return
+        end
+
+        local isOverwrite = profileSourceMap[name] ~= nil
+        currentProfileName = name
+        selectedConfig = name
+        pcall(function() NameLabel:SetText("Will save as: " .. name) end)
+        pcall(function()
+            if NameBox then
+                if type(NameBox.item) == "table" then NameBox.item.value = name end
+                if type(NameBox.Set) == "function" then NameBox:Set(name) end
+            end
+        end)
+
+        local payload = buildProfilePayload()
+        local savedPath, err = saveProfile(name, payload)
+        if not savedPath then
+            UI_Library:Notify("Profiles", "Save FAILED: " .. tostring(err or "writefile?"))
+            print("[Profiles] Save FAILED", name, "err=", err, "log=", LAST_SAVE_LOG and LAST_SAVE_LOG.err)
+            return
+        end
+
+        -- Keep this name selected after refresh (do not snap to Default/none)
+        selectedConfig = name
+        currentProfileName = name
+        listProfiles()
+        refreshDrop(name)
+        local bytes = (LAST_SAVE_LOG and LAST_SAVE_LOG.bytes) or 0
+        local msg = isOverwrite
+            and string.format("Overwrote: %s (%d bytes)", name, bytes)
+            or string.format("Saved: %s (%d bytes)", name, bytes)
+        UI_Library:Notify("Profiles", msg)
+        print("[Profiles]", isOverwrite and "OVERWRITE" or "NEW", name, "→", savedPath, "bytes=", bytes)
+    end)
+
+    Files_Section:Button("Load Selected", function()
+        if not selectedConfig or selectedConfig == "" then
+            UI_Library:Notify("Profiles", "Pick a config in the dropdown first")
+            return
+        end
+
+        -- Built-in Default (no file) → reset timings + keep current UI defaults
+        if selectedConfig == "Default" and not profileSourceMap["Default"] then
+            resetTimingsToOriginal()
+            UI_Library:Notify("Profiles", "Loaded built-in Default timings")
+            return
+        end
+
+        local data, err = loadProfile(selectedConfig)
+        if not data then
+            UI_Library:Notify("Profiles", "Load failed: " .. tostring(err or selectedConfig))
+            print("[Profiles] Load FAILED", selectedConfig, "err=", err)
+            return
+        end
+
+        local tCount, sCount = applyProfilePayload(data)
+        setSaveName(selectedConfig, true)
+        UI_Library:Notify(
+            "Profiles",
+            string.format("Loaded: %s (%d timings, %d settings)", selectedConfig, tCount, sCount)
+        )
+    end)
+
+    Files_Section:Button("Delete Selected", function()
+        if not selectedConfig or selectedConfig == "" then
+            UI_Library:Notify("Profiles", "Nothing selected")
+            return
+        end
+        if selectedConfig == "Default" and not profileSourceMap["Default"] then
+            UI_Library:Notify("Profiles", "Default is built-in")
+            return
+        end
+        if not profileSourceMap[selectedConfig] then
+            UI_Library:Notify("Profiles", "Not a saved file: " .. tostring(selectedConfig))
+            return
+        end
+        local deletedName = selectedConfig
+        deleteProfile(selectedConfig)
+        selectedConfig = "Default"
+        setSaveName("Default", true)
+        refreshDrop()
+        UI_Library:Notify("Profiles", "Deleted: " .. deletedName)
+    end)
+
+    Files_Section:Button("Refresh List", function()
+        refreshDrop()
+        UI_Library:Notify("Profiles", "List refreshed")
+    end)
+
+    Files_Section:Button("Reset Timings (built-in)", function()
+        resetTimingsToOriginal()
+        UI_Library:Notify("Profiles", "Timings reset to built-in defaults")
+    end)
+
+    Files_Section:Divider("Debug")
+    Files_Section:Toggle("Config Debug Logs", false, function(on)
+        CONFIG_DEBUG = on and true or false
+        print("[Config] debug=" .. tostring(CONFIG_DEBUG))
+    end)
+    Files_Section:Button("Dump CFG to console", function()
+        print("[CFG]", "AutoParry=", CFG.AutoParry, "AutoDodge=", CFG.AutoDodge,
+            "AutoTargetNearest=", CFG.AutoTargetNearest, "MultiTarget=", CFG.MultiTarget,
+            "HeightMultiplier=", CFG.HeightMultiplier, "TargetFacingYou=", CFG.TargetFacingYou,
+            "YouFacingTarget=", CFG.YouFacingTarget, "DebugParry=", CFG.DebugParry,
+            "PingCompensate=", CFG.PingCompensate, "AutoPlay=", CFG.AutoPlay,
+            "APKeybind=", CFG.APKeybind)
+        print("[Numeric]", "AutoParryRange=", AutoParryRange, "MaxCycleRange=", MaxCycleRange,
+            "ParryWindow=", ParryWindow, "ProbabilityToParry=", ProbabilityToParry,
+            "ParryOffset=", ParryOffset, "DefaultReactionTime=", DefaultReactionTime,
+            "BlockHoldTime=", BlockHoldTime, "IncludeLocalCharacter=", IncludeLocalCharacter)
+        print("[Overlays]", "TargetMarker=", NoCrashState.TargetMarkerEnabled,
+            "OpponentHp=", NoCrashState.OpponentHpEnabled,
+            "PersonalHp=", NoCrashState.PersonalHpEnabled,
+            "CombatEsp=", NoCrashState.CombatEspEnabled,
+            "AnimDebugEsp=", NoCrashState.AnimDebugEspEnabled,
+            "HpViewRange=", NoCrashState.HpViewRange)
+        print("[LastSave]", LAST_SAVE_LOG and LAST_SAVE_LOG.ok, LAST_SAVE_LOG and LAST_SAVE_LOG.path,
+            LAST_SAVE_LOG and LAST_SAVE_LOG.bytes, LAST_SAVE_LOG and LAST_SAVE_LOG.err)
+    end)
+
+    -- Also keep legacy INS autosave as optional convenience
+    Files_Section:Divider("Legacy INS")
+    Files_Section:Button("INS LoadConfig", function()
+        pcall(function() UI_Library:LoadConfig(GameName) end)
+        UI_Library:Notify("Legacy", "INS LoadConfig called")
+    end)
+    Files_Section:Button("INS SaveConfig", function()
+        pcall(function() UI_Library:SaveConfig(GameName) end)
+        UI_Library:Notify("Legacy", "INS SaveConfig called")
+    end)
+
+    refreshDrop()
+end
+
+-- 6. Per-style button selector (Syndicatus-style Timings UI)
+-- Left: click a style → Right: only that style's reaction-time sliders
+local function CreateGroupSliders()
+    local StylePickSec = Config_Tab:Section("Style Editor", "Left")
+    local StyleSliderSec = Config_Tab:Section("Reaction Times", "Right")
+
+    -- Collect unique style names
+    local styleNames = {}
+    local stylesSeen = {}
+    for _, info in pairs(GameConfig or {}) do
+        local style = info.Style
+        if style and not stylesSeen[style] then
+            stylesSeen[style] = true
+            table.insert(styleNames, style)
+        end
+    end
+    table.sort(styleNames)
+
+    local currentStyleEdit = styleNames[1] or "KarateAnims"
+    local MAX_SLOTS = 16
+    local slots = {}
+    local StyleTitleLabel = nil
+    local StyleHintLabel = nil
+
+    -- Pre-create reusable slider slots (rebound when style changes)
+    for i = 1, MAX_SLOTS do
+        local slotIndex = i
+        local sl = StyleSliderSec:Slider("—", 0, 0.001, 0, 1, "s", function(v)
+            local s = slots[slotIndex]
+            if s and s.boundInfo then
+                s.boundInfo.ReactionTime = v
+            end
+        end)
+        sl:Set(0)
+        slots[i] = { slider = sl, boundId = nil, boundInfo = nil, name = "—" }
+    end
+
+    local function setSlotName(slot, text)
+        local sl = slot.slider
+        for _, m in pairs({ "SetText", "SetName", "SetTitle", "SetLabel" }) do
+            pcall(function()
+                if sl[m] then sl[m](sl, text) end
+            end)
+        end
+        for _, p in pairs({ "Title", "Name", "Text" }) do
+            pcall(function()
+                if rawget(sl, p) ~= nil then sl[p] = text end
+            end)
+        end
+        slot.name = text
+    end
+
+    local function animSortRank(name)
+        name = tostring(name or "")
+        if name:find("%(A%)") then return 2, name end
+        if name:find("%(B%)") then return 3, name end
+        if name:find("Feint") then return 4, name end
+        -- Natural M1 order: 1st, 2nd, 3rd, 4th, then M2/other
+        local m1 = name:match("(%d)stM1") or name:match("(%d)ndM1") or name:match("(%d)rdM1") or name:match("(%d)thM1")
+        if m1 then return 1, tonumber(m1) or 99, name end
+        if name:find("M2") or name == "Heavy" then return 5, 0, name end
+        return 6, 0, name
+    end
+
+    bindStyle = function(styleName)
+        if not styleName or styleName == "" then return end
+        currentStyleEdit = styleName
+        currentStyleEditName = styleName
+
+        local collected = {}
+        for id, info in pairs(GameConfig) do
+            if info.Style == styleName then
+                table.insert(collected, { id = id, info = info })
+            end
+        end
+
+        table.sort(collected, function(a, b)
+            local ra, xa, na = animSortRank(a.info.DisplayName)
+            local rb, xb, nb = animSortRank(b.info.DisplayName)
+            if ra ~= rb then return ra < rb end
+            if type(xa) == "number" and type(xb) == "number" and xa ~= xb then return xa < xb end
+            return tostring(na) < tostring(nb)
+        end)
+
+        local nice = styleName:gsub("Anims", "")
+        if StyleTitleLabel then
+            pcall(function()
+                StyleTitleLabel:SetText(string.format("EDITING: %s  (%d anims)", nice, #collected))
+            end)
+        end
+        if StyleHintLabel then
+            pcall(function()
+                StyleHintLabel:SetText("Right side shows " .. nice .. " only")
+            end)
+        end
+
+        -- Clear previous AnimationIdSliders entries that pointed at these slots
+        for id, slider in pairs(AnimationIdSliders) do
+            for i = 1, MAX_SLOTS do
+                if slots[i].slider == slider then
+                    AnimationIdSliders[id] = nil
+                end
+            end
+        end
+
+        for i = 1, MAX_SLOTS do
+            local slot = slots[i]
+            local entry = collected[i]
+
+            if entry then
+                local info = entry.info
+                local prefix = (info.Blackflash and "Blackflash ")
+                    or (info.Awakened and "Awakened ")
+                    or ""
+                local label = prefix .. (info.DisplayName or ("Anim " .. i))
+                if info.Heavy or (info.DisplayName and tostring(info.DisplayName):find("M2")) then
+                    label = label .. " [HEAVY]"
+                end
+                if info.ParryFunction then
+                    label = label .. " [FN]"
+                end
+
+                slot.boundId = entry.id
+                slot.boundInfo = info
+                AnimationIdSliders[entry.id] = slot.slider
+                setSlotName(slot, label)
+                pcall(function()
+                    slot.slider:Set(info.ReactionTime or DefaultReactionTime)
+                end)
+                pcall(function()
+                    if slot.slider.SetVisible then slot.slider:SetVisible(true) end
+                end)
+            else
+                slot.boundId = nil
+                slot.boundInfo = nil
+                setSlotName(slot, "—")
+                pcall(function() slot.slider:Set(0) end)
+                pcall(function()
+                    if slot.slider.SetVisible then slot.slider:SetVisible(false) end
+                end)
+            end
+        end
+
+        UI_Library:Notify("Timings", "Now editing: " .. nice)
+    end
+
+    StylePickSec:Info("Click a style → right side shows ONLY that style's timings")
+    StyleTitleLabel = StylePickSec:Label("EDITING: —")
+    StyleHintLabel = StylePickSec:Label("Pick a style below")
+
+    StylePickSec:Slider("Default RT", DefaultReactionTime, 0.001, 0, 0.5, "s", function(v)
+        DefaultReactionTime = v
+    end):Set(DefaultReactionTime)
+
+    StylePickSec:Button("Reset Current Style", function()
+        for i = 1, MAX_SLOTS do
+            local slot = slots[i]
+            if slot.boundId and OriginalTimings[slot.boundId] then
+                local rt = OriginalTimings[slot.boundId]
+                slot.boundInfo.ReactionTime = rt
+                pcall(function() slot.slider:Set(rt) end)
+            end
+        end
+        UI_Library:Notify("Timings", "Reset " .. (currentStyleEdit:gsub("Anims", "") or "?"))
+    end)
+
+    StylePickSec:Info("--- Styles ---")
+
+    -- Button grid: up to 3 style buttons per row (AddButton when supported)
+    do
+        local COLS = 3
+        local i = 1
+        while i <= #styleNames do
+            local s1 = styleNames[i]
+            local row = StylePickSec:Button(s1:gsub("Anims", ""), function()
+                bindStyle(s1)
+            end)
+            for c = 1, COLS - 1 do
+                local idx = i + c
+                if idx <= #styleNames and row and row.AddButton then
+                    local sN = styleNames[idx]
+                    pcall(function()
+                        row:AddButton(sN:gsub("Anims", ""), function()
+                            bindStyle(sN)
+                        end)
+                    end)
+                elseif idx <= #styleNames then
+                    -- Fallback: separate button if AddButton isn't available
+                    local sN = styleNames[idx]
+                    StylePickSec:Button(sN:gsub("Anims", ""), function()
+                        bindStyle(sN)
+                    end)
+                end
+            end
+            i = i + COLS
+        end
+    end
+
+    -- Initial bind
+    if #styleNames > 0 then
+        bindStyle(currentStyleEdit)
+    end
+end
+
+-- ==========================================================
+-- UI INITIALIZATION
+-- ==========================================================
+local function InitializeUI()
+    CreateAutoPlaySection()
+    CreateAPSection()
+    CreateGlobalConfigSection()
+    CreateFoldersSection()
+    CreateOverlaySection()
+    CreateClipboardSection()
+    CreateFilesSection()
+    CreateGroupSliders()
+end
+
+InitializeUI()
+end
+__LB67_UIAndRhythm()
+
+UpdateClipboardSection()
+
+-- ==========================================
+local PARRY_DISTANCE = 15 
+local PARRY_COOLDOWN = 0.1
+
+local activeOrbs = {}
+local lastParryAt = 0
+
+local function GetLocalHRP()
+    local localChar = LocalPlayer.Character
+    local HRP = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    if not HRP then return nil end 
+    return HRP
+end
+
+local function checkRange(studs, origin)
+    local hrp = GetLocalHRP()
+    if not hrp or not origin then return false end
+    return (hrp.Position - origin.Position).Magnitude < studs
+end
+
+local orbSpawnTimes = {} 
+
+local function ListenForOrbs()
+    print("[Orbs] Listening for Ardour balls")
+
+    return RunService.Heartbeat:Connect(function()
+        if tick() - lastParryAt < 0.08 then return end
+
+        local character = LocalPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+
+        local thrownFolder = workspace:FindFirstChild("Thrown")
+        if not thrownFolder then return end
+
+        local myPosition = hrp.Position
+
+        for _, orb in ipairs(thrownFolder:GetChildren()) do
+            if (orb.Name == "ArdourBall2" or orb.Name == "ArdourBall") and orb:IsA("BasePart") then
+                if (myPosition - orb.Position).Magnitude <= PARRY_DISTANCE then
+                    lastParryAt = tick()
+                    local t = os.clock()
+                    BlockStart(t, 0.15)
+                    BlockEnd()
+                    break
+                end
+            end
         end
     end)
 end
 
-pcall(function()
-    if LocalPlayer.Character then hookCharacter(LocalPlayer.Character) end
-    LocalPlayer.CharacterAdded:Connect(function(c)
-        pendingRespawn = nil
-        hookCharacter(c)
-    end)
-end)
+-- Start listening
+if game.PlaceId == 8668476218 or game.PlaceId == 134572803901609 then  
+    NoCrashState:AddConnection(ListenForOrbs())
+end
 
--- ── MAIN LOOP (RenderStepped — same AP path as source) ──
-SyndicatusState:AddConnection(RunService.RenderStepped:Connect(function()
+-- ==========================================
+-- Configs 
+-- ==========================================
+
+local ParryKey = string.byte("F")
+local DodgeKey = string.byte("Q")
+
+local KeyHeld = false
+local TriggerParry = false
+local ReleaseDeadline = 0
+
+local Stunned = false
+local currentStunToken = 0
+
+local AnimationTracker = AnimationTrackerClass.new(IgnoreIds)
+local LocalTracker = AnimationTrackerClass.new(IgnoreIds)
+
+local DamageLogs = false
+-- IncludeLocalCharacter declared earlier (with CFG) so profile/UI share one binding
+
+local connection = nil
+local previousHealth = 100
+local lastCharacter = nil
+
+local SelectAllMode = true
+local TargetCharacters = {}
+local EspTrackers = {}
+
+local CurrentIndex = 1
+local COLOR_WHITE = Color3.fromRGB(255, 255, 255)
+local COLOR_RED = Color3.fromRGB(255, 50, 50)
+local COLOR_GREEN = Color3.fromRGB(50, 255, 50)
+
+local AnimationRegistry = {}
+local LastPendingRegData = nil
+local InputRegisteredTime = nil
+local ParryRegisteredTime = nil
+local InputLatency = 0 -- (Parry - Input)
+
+-- Per-frame animation cache so we don't call Tracker:Update multiple times on the same character
+local FrameAnimCache = {}
+local FrameCacheClock = 0
+
+-- True when character has Humanoid+Animator+HRP (avoids AnimationTracker spam / dead updates)
+local function instanceHasAddress(inst)
+    if not inst then return false end
+    -- Instances are userdata — never rawget them
+    local okA, vA = pcall(function() return inst.Address end)
+    if okA and type(vA) == "number" and vA ~= 0 then return true end
+    if type(getaddress) == "function" then
+        local ok, v = pcall(getaddress, inst)
+        if ok and type(v) == "number" and v ~= 0 then return true end
+    end
+    return false
+end
+
+local function characterTrackable(character)
+    if not character or character.Parent == nil then return false end
+    local hum = character:FindFirstChildOfClass("Humanoid")
+        or character:FindFirstChildWhichIsA("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    if not character:FindFirstChild("HumanoidRootPart") then return false end
+    local animator = hum:FindFirstChildOfClass("Animator")
+        or hum:FindFirstChildWhichIsA("Animator")
+    if not animator then return false end
+    -- Address is optional here; Update wrapper validates memory Address + silences library spam
+    return true
+end
+
+local function GetActiveAnimationsCached(character, tracker)
     local now = os.clock()
+    if now ~= FrameCacheClock then
+        table.clear(FrameAnimCache)
+        FrameCacheClock = now
+    end
 
-    -- Drive LocalTracker at render rate — this makes AnimationAdded fire instantly
-    -- on new local anims (parry stance, stun, our own M1s). Without this, the event
-    -- never triggers because matcha needs Update() to detect new animations.
-    if LocalTracker then
-        local lc = LocalPlayer.Character
-        if lc and lc.Parent then
-            pcall(function() LocalTracker:Update(lc) end)
+    local cached = FrameAnimCache[character]
+    if cached then
+        return cached
+    end
+
+    -- Gate: library prints "Failed to resolve Animator." and returns nil when missing —
+    -- never call Update until the character is fully trackable.
+    if not characterTrackable(character) then
+        FrameAnimCache[character] = {}
+        return FrameAnimCache[character]
+    end
+
+    local active = tracker:Update(character) or {}
+    FrameAnimCache[character] = active
+    return active
+end
+
+local function ResetCombatTrackers(reason)
+    pcall(function()
+        if LocalTracker and type(LocalTracker._cachedTracks) == "table" then
+            table.clear(LocalTracker._cachedTracks)
+        end
+    end)
+    pcall(function()
+        if AnimationTracker and type(AnimationTracker._cachedTracks) == "table" then
+            table.clear(AnimationTracker._cachedTracks)
+        end
+    end)
+    table.clear(FrameAnimCache)
+    table.clear(AnimationRegistry)
+    LastPendingRegData = nil
+    InputRegisteredTime = nil
+    ParryRegisteredTime = nil
+    KeyHeld = false
+    Stunned = false
+    if ParryState then
+        CurrentParryState = ParryState.IDLE
+    end
+    if reason and CFG and CFG.DebugParry then
+        print("[Sharingan] combat trackers reset:", reason)
+    end
+end
+
+
+local ParryState = {
+    IDLE = "idle",
+
+    INPUT_PENDING = "input_pending",   -- F was pressed locally, waiting for animation to appear
+    PARRYING = "parrying",             -- Animation just appeared
+    PARRYINGFAILED = "parryingfailed",       -- Animation didn't appear (Happens when you're on parry cooldown)
+
+    STUNNED = "stunned",
+    WINDOW_EXCEEDED = "window_exceeded", -- If you exceed the window cuz ur not targeting or ur
+
+    SUCCESS = "parrysuccess"       -- Parrying animation was detected so its parrying right now
+}
+
+local CurrentParryState = ParryState.IDLE
+
+local function ResetParryState()
+    KeyHeld = false
+    ReleaseDeadline = 0
+    BlockEnd()
+end
+
+local function TransitionToState(newState)
+    if CFG.DebugParry then
+        print(string.format("[Parry] %s -> %s", CurrentParryState, newState))
+    end
+    CurrentParryState = newState
+end
+
+-- ==========================================
+-- Helpers
+-- ==========================================
+
+local function ToggleDamageLogger(state)
+    if not state then
+        if connection then
+        connection:Disconnect()
+        connection = nil end
+        print("[Logger] Heartbeat damage logger DISABLED.")
+        return
+    end
+
+    if connection then return end -- Prevent duplicate connections
+    print("[Logger] Heartbeat damage logger ACTIVE.")
+    
+    connection = RunService.Heartbeat:Connect(function()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChild("Humanoid")
+        if not hum then return end 
+
+        if lastCharacter and (char.Address ~= lastCharacter.Address) then
+            lastCharacter = char
+            previousHealth = hum.Health
+        end
+        local currentHealth = hum.Health
+        if currentHealth < previousHealth then
+            local damageTaken = previousHealth - currentHealth
+            
+            if #TargetCharacters then
+                local activeAnimations = AnimationTracker:Update(TargetCharacter) or {}
+                
+                
+                for _, anim in activeAnimations do
+                    if not anim.AnimationId or anim.TimePosition < 0.1 or anim.TimePosition > 0.7 then continue end 
+                    local assetId = tostring(anim.AnimationId)
+                    local poolData = GameConfig[assetId]
+                    warn(string.format(
+                        "[HIT] %d DMG | Anim: %s (%s) %s | Frame Time: %.3f", 
+                        damageTaken, 
+                        poolData and poolData.DisplayName or anim.Name or "Unknown",
+                        assetId, 
+                        poolData and poolData.Style or "",
+                        anim.TimePosition or 0
+                    ))
+                end
+            end
+        end
+        previousHealth = currentHealth
+    end)
+    NoCrashState:AddConnection(connection)
+end
+
+-- ==========================================
+
+-- Luau register limit (200 locals/function): combat path runs in its own function scope
+local function __LB67_CombatRuntime()
+-- Parry Core Logic
+-- ==========================================
+
+
+local function GetHeightMultiplierForCharacter(TargetCharacter)
+    local succ, data = pcall(function()
+        local stateFolder = TargetCharacter and TargetCharacter:FindFirstChild("PlayerData")    
+        return stateFolder:GetAttribute("CurrentHeight")
+    end)
+    if succ then  
+        return data
+    else
+     --   print("failed to get height")
+        return 1
+    end
+end
+
+
+function Dodge(force)
+    -- force=true: used by Boxing M2 sequence (bypasses nothing critical; always input)
+    BlockEnd()
+    for _ = 1, 4 do
+        keypress(DodgeKey)
+        keyrelease(DodgeKey)
+    end
+end
+
+function BlockStart(StartTime, HoldFor)
+    if not StartTime then
+        if CFG.DebugParry then
+            warn("BlockStart: missing start time")
+        end
+        return
+    end
+
+    if CurrentParryState ~= ParryState.IDLE then
+        TransitionToState(ParryState.IDLE)
+    end
+
+    HoldFor = HoldFor or BlockHoldTime
+    ReleaseDeadline = StartTime + HoldFor
+    KeyHeld = true
+
+    if CFG.AutoParry then
+        keypress(ParryKey)
+    end
+end
+
+function BlockEnd()
+    KeyHeld = false
+    if CFG.AutoParry then
+        keyrelease(ParryKey)
+    end
+end
+
+
+-- ==========================================
+-- STATE MACHINE
+-- ==========================================
+
+
+--                  ==[Input State]==
+-- Local F keypress
+local function OnInputF()
+
+    if CurrentParryState == ParryState.IDLE then
+        InputRegisteredTime = os.clock()
+        TransitionToState(ParryState.INPUT_PENDING)
+    else
+    --    print("F was pressed while machine wasnt idle")
+    end
+end
+
+
+local function DebugParry()
+-- 1. Network Variables (These never rely on the parry window data, so we always calculate them)
+    local WeActuallyBlockedAt = ParryRegisteredTime
+    local WeWantedToBlockAt = InputRegisteredTime
+    local TimeTheServerReceived = InputLatency / 2
+
+    if LastPendingRegData then
+        -- 2. Animation Variables (Only extracted if the data actually exists)
+        local AnimationStartTime = LastPendingRegData.StartTime
+        local BlockStart = LastPendingRegData.BlockStart
+        local BlockExpire = LastPendingRegData.BlockExpire
+        
+        -- Relative Offsets (How far into the animation the window is)
+        local RelativeBlockStart = BlockStart - AnimationStartTime   -- e.g., 0.300s
+        local RelativeBlockExpire = BlockExpire - AnimationStartTime -- e.g., 0.650s
+        
+        -- Timeline Calculations
+        local ClientReactionTime = WeWantedToBlockAt - AnimationStartTime -- Relative to Anim Start (0)
+        local ServerRelativeTime = (WeActuallyBlockedAt - TimeTheServerReceived) - AnimationStartTime -- Relative to Anim Start (0)
+        
+        local IsSuccess = (ClientReactionTime >= RelativeBlockStart and ClientReactionTime <= RelativeBlockExpire)        
+        ----------------------------------------------------------------------
+        -- FULL DIAGNOSTICS LOG (Data Exists)
+        ----------------------------------------------------------------------
+        print(string.format(
+            "\n================ PARRY DIAGNOSTICS ================\n" ..
+            "[NETWORK STATE]\n" ..
+            "Total Input Latency:  %.3fs\n" ..
+            "One-Way Server Delay: %.3fs\n" ..
+            "---------------------------------------------------\n" ..
+            "[ANIMATION TIMELINE]\n" ..
+            "Target Parry Window:  %.3fs to %.3fs\n" ..
+            "Pressed F At:    %.3fs\n" ..
+            "Parry Registered At:  %.3fs (ONE-WAY)\n" ..
+            "---------------------------------------------------\n" ..
+            "[VERDICT]\n" ..
+            "Status:               %s\n" ..
+            "===================================================",
+            InputLatency,
+            TimeTheServerReceived,
+            RelativeBlockStart, 
+            RelativeBlockExpire,
+            ClientReactionTime,
+            ServerRelativeTime,
+            IsSuccess and "[SUCCESS]" or "[MISSED WINDOW]"
+        ))
+    else
+        ----------------------------------------------------------------------
+        -- LATENCY ONLY DIAGNOSTICS LOG (No Parry Data)
+        ----------------------------------------------------------------------
+        print(string.format(
+            "\n============ LATENCY ONLY DIAGNOSTICS ============\n" ..
+            "[NETWORK STATE]\n" ..
+            "Total Input Latency:  %.3fs\n" ..
+            "One-Way Server Delay: %.3fs\n" ..
+            "---------------------------------------------------\n" ..
+            "[ANIMATION TIMELINE]\n" ..
+            "No active parry window / registration data found.\n" ..
+            "===================================================",
+            InputLatency,
+            TimeTheServerReceived
+        ))
+    end
+end
+
+-- Parrying animation detected
+local function OnParryingAnimationSuccess()
+    if CurrentParryState == ParryState.INPUT_PENDING then
+        ParryRegisteredTime = os.clock()
+        InputLatency = os.clock() - InputRegisteredTime
+
+        if CFG.DebugParry then
+            DebugParry()
+        end
+        
+        TransitionToState(ParryState.PARRYING)
+    end
+end
+
+-- Parrying window passed without parrying
+local function OnParryingAnimationFailed()
+    if CurrentParryState == ParryState.INPUT_PENDING then
+        TransitionToState(ParryState.PARRYINGFAILED)
+        TransitionToState(ParryState.IDLE)
+    end
+end
+
+
+local StunToken = 0
+local function OnStunned()
+    if CurrentParryState ~= ParryState.STUNNED then 
+        TransitionToState(ParryState.STUNNED)
+    end
+
+    StunToken += 1
+    local MyToken = StunToken
+    
+    
+    scheduler.delay(0.4, function()
+        if MyToken == StunToken then 
+            BlockEnd()
+            TransitionToState(ParryState.IDLE)            
+        end
+    end)
+end
+
+
+local function OnSuccessfulParry()
+    if CurrentParryState == ParryState.PARRYING then  
+
+        local AnimId = LastPendingRegData.AnimationId
+        local AttackConfig = GameConfig[AnimId]
+        local ParryPressTime = tonumber(InputRegisteredTime - LastPendingRegData.StartTime)
+        local EstimatedParryWindow = os.clock() - LastPendingRegData.StartTime
+        
+        -- SANITY CHECK happens when we evaludte outside of parrying
+        if ParryPressTime > 1 or ParryPressTime < 0 then
+        --    print("HERE", ParryPressTime, os.clock() - InputRegisteredTime, os.clock() - LastPendingRegData.StartTime)
+        --    warn("AAAAAAA")
+            return
+        end
+        
+        -- NOTIFY UI
+        UI_Library:Notify(
+            "Parry Success", 
+            string.format("%.3fs PT: %.3fs - %s %s", 
+                ParryPressTime, 
+                EstimatedParryWindow,
+                AttackConfig.Style, 
+                AttackConfig.DisplayName
+            )
+        )
+        
+        LastPendingRegData.LearnedParryTime = ParryPressTime
+        LastPendingRegData.Success = true
+        --LastPendingRegData.Processed = true
+
+        -- CLEANUP
+        --InputRegisteredTime = nil
+        
+        ResetParryState()
+        TransitionToState(ParryState.SUCCESS)
+        TransitionToState(ParryState.IDLE)
+    else
+        warn("Tried to evaluate outside of parrying")
+        print(CurrentParryState)
+    end
+end
+
+local function OnWindowExceeded()
+    if CurrentParryState == ParryState.PARRYING then 
+        TransitionToState(ParryState.WINDOW_EXCEEDED)
+        TransitionToState(ParryState.IDLE)
+    end
+end
+
+local function GetActiveAnimationsForCharacterAsDictionary(character)
+    local returnTable = {}
+    local activeAnimations = GetActiveAnimationsCached(character, LocalTracker)
+    if not activeAnimations or #activeAnimations == 0 then return returnTable end
+
+    for _, anim in ipairs(activeAnimations) do
+        if anim.AnimationId then
+            returnTable[anim.AnimationId] = anim
         end
     end
 
-    -- Local-player health exit: no reason to run AP when we're dead or 0 HP
-    do
-        local lc = LocalPlayer.Character
-        local hum = lc and lc:FindFirstChildWhichIsA("Humanoid")
-        if not hum or hum.Health <= 0 then
-            if KeyHeld then BlockEnd() end
+    return returnTable
+end
+
+local function ParryTask()
+    local now = os.clock()
+
+    if KeyHeld and now > ReleaseDeadline then
+        BlockEnd()
+    end
+
+    if CurrentParryState == ParryState.INPUT_PENDING then
+        local MaxLatency = 0.5
+        local timePassed = now - (InputRegisteredTime or now)
+
+        local activeAnims = {}
+        if type(GetActiveAnimationsForCharacterAsDictionary) == "function" then
+            local ok, result = pcall(GetActiveAnimationsForCharacterAsDictionary, LocalPlayer.Character)
+            if ok and type(result) == "table" then
+                activeAnims = result
+            end
+        end
+        for _, anim in pairs(activeAnims) do
+            if anim and ParryingAnimSet[anim.AnimationId] then
+                if type(OnParryingAnimationSuccess) == "function" then
+                    OnParryingAnimationSuccess()
+                end
+                break
+            end
+        end
+
+        local stillHolding = false
+        pcall(function() stillHolding = iskeypressed(ParryKey) and true or false end)
+        if not stillHolding then
+            if CFG.DebugParry then
+                warn("F key was released before parrying animation appeared")
+            end
+            ResetParryState()
+            TransitionToState(ParryState.IDLE)
+            return
+        end
+
+        if timePassed > MaxLatency then
+            if CFG.DebugParry then
+                warn(string.format(
+                    "Parrying animation didn't appear (likely CD) MAX: %.2f | TIME: %.2f",
+                    MaxLatency,
+                    timePassed
+                ))
+            end
+            OnParryingAnimationFailed()
+            TransitionToState(ParryState.IDLE)
+        end
+
+    elseif CurrentParryState == ParryState.PARRYING then
+        if ParryRegisteredTime and now > (ParryRegisteredTime + ParryWindow + 0.3) then
+            OnWindowExceeded()
+        end
+    end
+end
+
+-- ==========================================
+
+
+local ParryLearningLog = {}  -- {[animId] = {TriggerTime, Style, DisplayName, Count}}
+
+local function onLocalAnimationAdded(anim)
+    local animId = anim.AnimationId
+    if not animId then return end
+
+    if ParriedAnimSet[animId] then
+        OnSuccessfulParry()
+        return
+    end
+
+    if ParryingAnimSet[animId] then
+        if InputRegisteredTime then
+            OnParryingAnimationSuccess()
+        end
+        return
+    end
+
+    if GameConfig[animId] then
+        OnStunned()
+    end
+end
+
+NoCrashState:AddConnection(LocalTracker.AnimationAdded:Connect(onLocalAnimationAdded))
+
+local function LogAnimation(assetId, trackInfo)
+    if not AnimationsLoggedCache[assetId] then
+        AnimationsLoggedCache[assetId] = { Name = trackInfo.Name }
+        table.insert(AnimationsLoggedOrder, assetId)
+        UpdateClipboardSection()
+    end
+end
+
+
+-- (GetActiveAnimationsForCharacterAsDictionary moved above ParryTask)
+
+-- ==========================================
+-- Parry Evaluation
+-- ==========================================
+
+local DodgeLockoutEnd = 0
+
+local function ValidateLocalCharacter()
+    local localCharacter = LocalPlayer and LocalPlayer.Character
+    local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
+    if not localRoot or Stunned then return nil end
+    return localCharacter, localRoot
+end
+
+local function ValidateTargetCharacter(character)
+    local targetRoot = character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return nil end
+    return targetRoot
+end
+
+local function CheckCharacterDistance(localRoot, targetRoot)
+    return (targetRoot.Position - localRoot.Position).Magnitude
+end
+
+local function UpdateCharacterESP(character, Distance)
+    local inRange = Distance <= AutoParryRange
+    local apOn = CFG.AutoParry
+
+    -- Only touch ESP text when combat ESP is enabled
+    if NoCrashState.CombatEspEnabled then
+        local tracker = EspTrackers[character]
+        if tracker and tracker.ChangeText then
+            if not apOn then
+                tracker:ChangeText("Name", character.Name .. " | AP OFF", COLOR_RED)
+            elseif not inRange then
+                tracker:ChangeText("Name", character.Name .. " | " .. math.floor(Distance) .. "m", COLOR_RED)
+            else
+                tracker:ChangeText("Name", character.Name .. " | " .. math.floor(Distance) .. "m", COLOR_GREEN)
+            end
+        end
+    end
+
+    return apOn and inRange
+end
+
+local function CalculateParryTiming(attackConfig, StartTime, Target)
+    
+    local optimalReactionTime = (attackConfig.ReactionTime or DefaultReactionTime)
+    local HeightMultiplier = 1 
+    if CFG.HeightMultiplier then  
+       HeightMultiplier = GetHeightMultiplierForCharacter(Target)
+    end
+
+    local CompValue = 0
+    if CFG.PingCompensate then
+        CompValue = (GetPingValue() or 50) / 1000 * 0.5
+        optimalReactionTime -= CompValue
+    end
+
+    local adjustedReactionTime = (optimalReactionTime * HeightMultiplier) + ParryOffset
+
+
+    local parryWindowStart = adjustedReactionTime
+    local parryWindowEnd = adjustedReactionTime + ParryWindow
+
+    local ClockStart = StartTime + parryWindowStart
+    local ClockEnd = StartTime + parryWindowEnd
+    
+    return ClockStart, ClockEnd
+end
+
+local ConstLatency = 0.018
+local EXECUTE_DEBOUNCE = 0.5
+
+local function UpdateAnimationRegistry(animKey, anim, now, currentTrackTime, attackConfig, TargetCharacter)
+
+    if not AnimationRegistry[animKey] then
+        local adjustedNow = now - ConstLatency -- - currentTrackTime
+        local BlockStart, BlockExpire = CalculateParryTiming(attackConfig, adjustedNow, TargetCharacter)
+
+        AnimationRegistry[animKey] = {
+            StartTime = adjustedNow,
+            Processed = false,
+            CurrentClockTime = os.clock(),
+            CurrentTrackTime = currentTrackTime,
+            ReactionTime = attackConfig,
+            Ignore = false,
+            AnimationId = anim.AnimationId,
+            DidALoop = false,
+            BlockStart = BlockStart,
+            BlockExpire = BlockExpire,
+            RandomNum = math.random(1, 100),
+            LastExecuteTime = 0, -- debounce timestamp
+        }
+    end
+    
+    local regData = AnimationRegistry[animKey]
+    
+    if regData.CurrentTrackTime and (currentTrackTime < regData.CurrentTrackTime) then
+        local BlockStart, BlockExpire = CalculateParryTiming(attackConfig, now - currentTrackTime, TargetCharacter)
+        
+        regData.Processed = false
+        regData.DidALoop = true
+        if CFG.DebugParry then
+            warn("Loop detected")
+        end
+        regData.BlockStart = BlockStart
+        regData.BlockExpire = BlockExpire
+        regData.StartTime = now - ConstLatency
+    end
+    
+    regData.CurrentClockTime = os.clock()
+    regData.CurrentTrackTime = currentTrackTime
+
+    if LastPendingRegData == regData then
+        LastPendingRegData = regData
+    end
+
+    return regData
+end
+
+local function CheckAnimationDirection(character, localCharacter, localRoot, targetRoot, attackConfig)
+    if character.Address == localCharacter.Address then return true end
+    
+    local direction = (targetRoot.Position - localRoot.Position).Unit
+    local distance = (targetRoot.Position - localRoot.Position).Magnitude
+    local isHeavy = attackConfig.DisplayName == "M2" or attackConfig.DisplayName == "Heavy" or attackConfig.Heavy
+  --  print(distance)
+    
+    if not isHeavy then -- and distance > 4 then  
+        if CFG.TargetFacingYou and targetRoot.CFrame.LookVector:Dot(-direction) < 0.1 then return false end
+        if CFG.YouFacingTarget and localRoot.CFrame.LookVector:Dot(direction) < 0.1 then return false end
+    end
+    
+    return true
+end
+
+local function ExecuteParry(regData, attackConfig)
+    local now = os.clock()
+    if (now - regData.LastExecuteTime) < EXECUTE_DEBOUNCE then
+        return
+    end
+    regData.LastExecuteTime = now
+
+    local isHeavy = attackConfig.DisplayName == "M2" or attackConfig.DisplayName == "Heavy" or attackConfig.Heavy
+
+    if attackConfig.Jump then 
+        task.spawn(function()
+            keypress(32)
+            task.wait(.06)
+            keyrelease(32)                      
+        end)
+        DodgeLockoutEnd = os.clock() + 0.2
+    elseif isHeavy and CFG.AutoDodge then
+        if CFG.AutoParry then  
+            Dodge()            
+        end
+    --    DodgeLockoutEnd = os.clock() + 0.2
+    else
+        local debugOn = CFG.DebugParry
+
+        if LastPendingRegData ~= regData then
+            LastPendingRegData = regData
+            BlockStart(LastPendingRegData.BlockStart)
+            if debugOn then
+                print(string.format("Block triggered by [%s | %s]", attackConfig.Style, attackConfig.DisplayName))
+            end
+        elseif regData.DidALoop then
+            if debugOn then
+                print(string.format(
+                    "Block retriggered for [%s | %s] (loop)",
+                    attackConfig.Style,
+                    attackConfig.DisplayName
+                ))
+            end
+            regData.DidALoop = false
+            BlockStart(regData.BlockStart)
+        end
+    end
+end
+
+local function EvaluateAnimation(anim, character, localCharacter, localRoot, targetRoot, currentActiveIds)
+    -- ANIMATION VALIDATION
+    if not anim.AnimationId then return end
+    local animId = anim.AnimationId
+    local attackConfig = GameConfig[animId] or GameConfig[tostring(animId)]
+    if not attackConfig then return end
+    
+    local animKey = anim.Address or anim
+    currentActiveIds[animKey] = true
+    
+    -- ANIMATION REGISTRY & STATE
+    local now = os.clock()
+    local regData = UpdateAnimationRegistry(animKey, anim, now, anim.TimePosition or 0, attackConfig, character)
+    if regData.Processed then return end
+
+    if CheckCharacterDistance(localRoot, targetRoot) > AutoParryRange then return end
+    
+    -- PARRY FUNCTION OVERRIDE (Boxing M2 etc.)
+    if attackConfig.ParryFunction
+        and (now - regData.StartTime) <= (attackConfig.ReactionTime or DefaultReactionTime) + ParryWindow / 2 then
+        -- OFF = player handles Boxing M2 manually; mark processed so normal AP won't steal it
+        if attackConfig.BoxingM2 and not CFG.AutoBoxingM2 then
+            regData.Processed = true
+            return
+        end
+        if CFG.AutoParry then
+            attackConfig.ParryFunction({
+                RegistryData = regData,
+                Mob = character,
+                AnimationData = anim,
+                AnimationTracker = AnimationTracker,
+            })
+        end
+        return
+    end
+    
+    -- DIRECTION CHECKS
+    if not CheckAnimationDirection(character, localCharacter, localRoot, targetRoot, attackConfig) then return end
+    
+    if regData.RandomNum > ProbabilityToParry then
+        regData.Processed = true
+--        print("Skip b/c PTP", RandomNum, ProbabilityToParry)
+        return
+    end
+    
+    -- PARRY EXECUTION
+    local BlockExpireTimer = regData.BlockExpire - now
+    
+    if now >= regData.BlockStart and BlockExpireTimer >= 0 then
+    --    if not LastPendingRegData or LastPendingRegData.Proc then
+            ExecuteParry(regData, attackConfig)
+    --    end
+    end
+end
+
+local function EvaluateCharacter(character, localCharacter, localRoot, currentActiveIds)
+    -- Skip corpses / streaming characters (no Animator yet) — prevents resolve spam & dead AP
+    if not characterTrackable(character) then return end
+
+    local targetRoot = ValidateTargetCharacter(character)
+    if not targetRoot then return end
+
+    local distance = CheckCharacterDistance(localRoot, targetRoot)
+    UpdateCharacterESP(character, distance)
+
+    local activeAnimations = GetActiveAnimationsCached(character, AnimationTracker)
+    if not activeAnimations or #activeAnimations == 0 then return end
+
+    for _, anim in ipairs(activeAnimations) do
+        EvaluateAnimation(anim, character, localCharacter, localRoot, targetRoot, currentActiveIds)
+    end
+end
+
+local function EvaluateParryTriggers()
+    -- Hot path: no locked targets → nothing to evaluate (registry already idle)
+    if #TargetCharacters == 0 then
+        if next(AnimationRegistry) ~= nil then
+            table.clear(AnimationRegistry)
+            LastPendingRegData = nil
+        end
+        return
+    end
+
+    local localCharacter, localRoot = ValidateLocalCharacter()
+    if not localCharacter or not localRoot then return end
+
+    local currentActiveIds = {}
+
+    for _, character in ipairs(TargetCharacters) do
+        EvaluateCharacter(character, localCharacter, localRoot, currentActiveIds)
+    end
+
+    for key, val in pairs(AnimationRegistry) do
+        if not currentActiveIds[key] then
+            AnimationRegistry[key] = nil
+            if LastPendingRegData == val then
+                LastPendingRegData = nil
+            end
+        end
+    end
+end
+
+-- ==========================================
+-- ==========================================
+
+local function ProcessEspAndLogging()
+    local showAnimDump = NoCrashState.AnimDebugEspEnabled
+    local hasTrackers = NoCrashState.CombatEspEnabled or showAnimDump
+
+    for i = #TargetCharacters, 1, -1 do
+        local character = TargetCharacters[i]
+        local tracker = EspTrackers[character]
+
+        if tracker and not tracker.ChangeText then
+            EspTrackers[character] = nil
+            table.remove(TargetCharacters, i)
+            continue
+        end
+
+        -- Always scan anims for unknown-ID logging (clipboard), even with ESP off
+        local activeAnimations = GetActiveAnimationsCached(character, AnimationTracker)
+
+        for _, anim in ipairs(activeAnimations) do
+            local assetId = anim.AnimationId
+            if not assetId then continue end
+            local numericId = tonumber(string.match(tostring(assetId), "%d+"))
+            if numericId and IgnoreIdSet[numericId] then continue end
+            local poolData = GameConfig[tostring(assetId)]
+            if not poolData then
+                local resolvedName = anim.Name or "???"
+                LogAnimation(assetId, { Name = resolvedName, AnimationId = assetId })
+            end
+        end
+
+        if not hasTrackers or not tracker then continue end
+
+        if not showAnimDump then
+            -- Clear any leftover debug line when anim dump is off
+            if tracker.ChangeText then
+                tracker:ChangeText("CurrentlyPlaying", "", COLOR_WHITE)
+            end
+            continue
+        end
+
+        if #activeAnimations == 0 then
+            tracker:ChangeText("CurrentlyPlaying", "None", COLOR_WHITE)
+            continue
+        end
+
+        local lines = {}
+        for _, anim in ipairs(activeAnimations) do
+            local assetId = anim.AnimationId
+            if not assetId then continue end
+            local numericId = tonumber(string.match(tostring(assetId), "%d+"))
+            if numericId and IgnoreIdSet[numericId] then continue end
+
+            local poolData = GameConfig[tostring(assetId)]
+            local resolvedName = (poolData and poolData.DisplayName) or anim.Name
+
+            table.insert(lines, string.format(
+                "%s (%s) | ID: %s | Time: %.2f | Timing: %.2f %s | Speed: %.2f",
+                tostring(resolvedName),
+                poolData and poolData.Style or "???",
+                tostring(assetId),
+                anim.TimePosition or 0,
+                (poolData and poolData.ReactionTime) or DefaultReactionTime,
+                poolData and "[Logged]" or "[Unknown]",
+                anim.Speed or 1
+            ))
+        end
+
+        if tracker.Name then
+            tracker:ChangeText("CurrentlyPlaying", table.concat(lines, "\n"), COLOR_WHITE)
+        end
+    end
+end
+
+function ClearAllEspTrackers()
+    for char, tracker in pairs(EspTrackers) do
+        if tracker and tracker.Destroy then            
+            if ESP_Utility.TrackersToUpdate[tracker] then
+                ESP_Utility.TrackersToUpdate[tracker] = nil
+            end
+
+            -- 2. Destroy the tracker object
+            tracker:Destroy()
+        end
+    end
+    table.clear(EspTrackers) -- Safer than re-assigning {} to preserve table memory references
+end
+
+function UpdateTargetCharacters(charactersList)
+    ClearAllEspTrackers()
+    table.clear(TargetCharacters)
+
+    local wantEsp = NoCrashState.CombatEspEnabled or NoCrashState.AnimDebugEspEnabled
+
+    for _, character in charactersList do
+        table.insert(TargetCharacters, character)
+
+        -- Only spawn ESP boxes when a visual toggle is on
+        if wantEsp and character and character:FindFirstChild("HumanoidRootPart") and ESP_Utility and ESP_Utility.NewTracker then
+            local tracker = ESP_Utility.NewTracker(character.HumanoidRootPart, character.Name, COLOR_RED)
+            if tracker and tracker.Name then
+                tracker:AddText("CurrentlyPlaying", nil, "")
+            end
+            EspTrackers[character] = tracker
+        end
+    end
+end
+
+-- ==========================================================
+-- Lightweight X-target and health overlays
+-- The Drawing calls are isolated and throttled so an unsupported drawing feature
+-- cannot take down the combat loop or recreate objects every frame.
+-- ==========================================================
+function NoCrashState:SetVisible(drawing, visible)
+    if drawing then
+        pcall(function() drawing.Visible = visible end)
+    end
+end
+
+-- Matcha's existing ESP uses WorldToScreen. Keep the camera call only as a
+-- fallback so the overlay works with either projection implementation.
+function NoCrashState:Project(worldPosition)
+    local ok, point, visible = pcall(function()
+        if type(WorldToScreen) == "function" then
+            return WorldToScreen(worldPosition)
+        end
+
+        local camera = workspace.CurrentCamera
+        if camera then
+            return camera:WorldToViewportPoint(worldPosition)
+        end
+    end)
+
+    if not ok or not point or visible ~= true then
+        return nil, false
+    end
+    if point.Z and point.Z <= 0 then
+        return nil, false
+    end
+    return point, true
+end
+
+function NoCrashState:EnsureTargetMarker()
+    if self.TargetMarker then return self.TargetMarker end
+
+    local marker = {
+        Outline = self:AddDrawing("Square"),
+        Box = self:AddDrawing("Square"),
+        Text = self:AddDrawing("Text"),
+    }
+
+    pcall(function()
+        marker.Outline.Filled = false
+        marker.Outline.Color = Color3.fromRGB(10, 10, 10)
+        marker.Outline.Thickness = 3
+        marker.Box.Filled = false
+        marker.Box.Color = Color3.fromRGB(255, 65, 65)
+        marker.Box.Thickness = 1
+        marker.Text.Color = Color3.fromRGB(255, 235, 235)
+        marker.Text.Size = 12
+        marker.Text.Center = true
+        marker.Text.Outline = true
+    end)
+
+    self.TargetMarker = marker
+    return marker
+end
+
+function NoCrashState:HideTargetMarker()
+    local marker = self.TargetMarker
+    if marker then
+        self:SetVisible(marker.Outline, false)
+        self:SetVisible(marker.Box, false)
+        self:SetVisible(marker.Text, false)
+    end
+end
+
+function NoCrashState:UpdateTargetMarker()
+    if not self.TargetMarkerEnabled then
+        self:HideTargetMarker()
+        return
+    end
+
+    local character = TargetCharacters[1]
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then
+        self:HideTargetMarker()
+        return
+    end
+
+    local point, visible = self:Project(root.Position + Vector3.new(0, 3.2, 0))
+    if not visible then
+        self:HideTargetMarker()
+        return
+    end
+
+    local marker = self:EnsureTargetMarker()
+    local size = math.clamp(2200 / point.Z, 20, 48)
+    local position = Vector2.new(point.X - size / 2, point.Y - size / 2)
+
+    pcall(function()
+        marker.Outline.Position = position
+        marker.Outline.Size = Vector2.new(size, size)
+        marker.Box.Position = position
+        marker.Box.Size = Vector2.new(size, size)
+        marker.Text.Text = "[X] " .. tostring(character.Name)
+        marker.Text.Position = Vector2.new(point.X, point.Y - size / 2 - 15)
+        marker.Outline.Visible = true
+        marker.Box.Visible = true
+        marker.Text.Visible = true
+    end)
+end
+
+function NoCrashState:EnsureHealthEntry(index)
+    local entry = self.HealthEntries[index]
+    if entry then return entry end
+
+    entry = {
+        Name = self:AddDrawing("Text"),
+        Background = self:AddDrawing("Square"),
+        Fill = self:AddDrawing("Square"),
+        Value = self:AddDrawing("Text"),
+    }
+
+    pcall(function()
+        entry.Name.Color = Color3.fromRGB(240, 240, 240)
+        entry.Name.Transparency = 1
+        entry.Name.Size = 11
+        entry.Name.Center = true
+        entry.Name.Outline = true
+        entry.Background.Color = Color3.fromRGB(42, 42, 42)
+        entry.Background.Transparency = 1
+        entry.Background.Filled = true
+        entry.Background.Thickness = 1
+        entry.Fill.Color = Color3.fromRGB(55, 230, 85)
+        entry.Fill.Transparency = 1
+        entry.Fill.Filled = true
+        entry.Value.Color = Color3.fromRGB(240, 240, 240)
+        entry.Value.Transparency = 1
+        entry.Value.Size = 10
+        entry.Value.Center = true
+        entry.Value.Outline = true
+    end)
+
+    self.HealthEntries[index] = entry
+    return entry
+end
+
+function NoCrashState:HideHealthEntry(entry)
+    if entry then
+        self:SetVisible(entry.Name, false)
+        self:SetVisible(entry.Background, false)
+        self:SetVisible(entry.Fill, false)
+        self:SetVisible(entry.Value, false)
+    end
+end
+
+function NoCrashState:UpdateOpponentHealth()
+    if not self.OpponentHpEnabled then
+        for _, entry in pairs(self.HealthEntries) do self:HideHealthEntry(entry) end
+        return
+    end
+
+    local folder = SelectedFolder and workspace:FindFirstChild(SelectedFolder)
+    local localCharacter = LocalPlayer.Character
+    local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
+    if not folder or not localRoot then
+        for _, entry in pairs(self.HealthEntries) do self:HideHealthEntry(entry) end
+        return
+    end
+
+    local candidates = {}
+    for _, character in ipairs(folder:GetChildren()) do
+        local humanoid = character:IsA("Model") and character:FindFirstChildWhichIsA("Humanoid")
+        local root = character:IsA("Model") and character:FindFirstChild("HumanoidRootPart")
+        if character ~= localCharacter and humanoid and root and humanoid.Health > 0 then
+            local distance = (localRoot.Position - root.Position).Magnitude
+            if distance <= self.HpViewRange then
+                table.insert(candidates, { Character = character, Humanoid = humanoid, Root = root, Distance = distance })
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b) return a.Distance < b.Distance end)
+    local displayed = 0
+
+    for _, candidate in ipairs(candidates) do
+        if displayed >= 12 then break end
+        local head = candidate.Character:FindFirstChild("Head") or candidate.Root
+        local point, visible = self:Project(head.Position + Vector3.new(0, 1.15, 0))
+        if visible then
+            displayed += 1
+            local entry = self:EnsureHealthEntry(displayed)
+            local width, height = 52, 4
+            local health = math.max(0, tonumber(candidate.Humanoid.Health) or 0)
+            local maximum = math.max(1, tonumber(candidate.Humanoid.MaxHealth) or 1)
+            local ratio = math.clamp(health / maximum, 0, 1)
+            local left = point.X - width / 2
+            local top = point.Y
+
+            pcall(function()
+                entry.Name.Text = tostring(candidate.Character.Name)
+                entry.Name.Position = Vector2.new(point.X, top - 13)
+                entry.Background.Position = Vector2.new(left, top)
+                entry.Background.Size = Vector2.new(width, height)
+                entry.Fill.Position = Vector2.new(left + 1, top + 1)
+                entry.Fill.Size = Vector2.new(ratio > 0 and math.max(1, (width - 2) * ratio) or 0, height - 2)
+                entry.Fill.Color = ratio >= 0.995 and Color3.fromRGB(55, 230, 85) or Color3.fromRGB(math.floor(235 * (1 - ratio)), math.floor(70 + 185 * ratio), 65)
+                entry.Value.Text = string.format("%d / %d", math.floor(health + 0.5), math.floor(maximum + 0.5))
+                entry.Value.Position = Vector2.new(point.X, top + 5)
+                entry.Name.Visible = true
+                entry.Background.Visible = true
+                entry.Fill.Visible = true
+                entry.Value.Visible = true
+            end)
+        end
+    end
+
+    for index = displayed + 1, #self.HealthEntries do
+        self:HideHealthEntry(self.HealthEntries[index])
+    end
+end
+
+function NoCrashState:EnsurePersonalHealth()
+    if self.PersonalHealth then return self.PersonalHealth end
+
+    self.PersonalHealth = {
+        Background = self:AddDrawing("Square"),
+        Fill = self:AddDrawing("Square"),
+        Value = self:AddDrawing("Text"),
+    }
+
+    pcall(function()
+        self.PersonalHealth.Background.Filled = true
+        self.PersonalHealth.Background.Color = Color3.fromRGB(42, 42, 42)
+        self.PersonalHealth.Background.Transparency = 1
+        self.PersonalHealth.Fill.Filled = true
+        self.PersonalHealth.Fill.Color = Color3.fromRGB(55, 230, 85)
+        self.PersonalHealth.Fill.Transparency = 1
+        self.PersonalHealth.Value.Color = Color3.fromRGB(245, 245, 245)
+        self.PersonalHealth.Value.Transparency = 1
+        self.PersonalHealth.Value.Size = 13
+        self.PersonalHealth.Value.Center = true
+        self.PersonalHealth.Value.Outline = true
+    end)
+    return self.PersonalHealth
+end
+
+function NoCrashState:UpdatePersonalHealth()
+    if not self.PersonalHpEnabled then
+        local entry = self.PersonalHealth
+        if entry then
+            self:SetVisible(entry.Background, false)
+            self:SetVisible(entry.Fill, false)
+            self:SetVisible(entry.Value, false)
+        end
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+    local camera = workspace.CurrentCamera
+    if not humanoid or humanoid.Health <= 0 or not camera then return end
+
+    local entry = self:EnsurePersonalHealth()
+    local width, height = 180, 6
+    local health = math.max(0, tonumber(humanoid.Health) or 0)
+    local maximum = math.max(1, tonumber(humanoid.MaxHealth) or 1)
+    local ratio = math.clamp(health / maximum, 0, 1)
+    local viewport = camera.ViewportSize
+    if not self.PersonalViewport or self.PersonalViewport.X ~= viewport.X or self.PersonalViewport.Y ~= viewport.Y then
+        self.PersonalViewport = viewport
+        self.PersonalPosition = Vector2.new((viewport.X - width) / 2, viewport.Y - 64)
+    end
+    local position = self.PersonalPosition
+
+    pcall(function()
+        entry.Background.Position = position
+        entry.Background.Size = Vector2.new(width, height)
+        entry.Fill.Position = position + Vector2.new(1, 1)
+        entry.Fill.Size = Vector2.new(ratio > 0 and math.max(1, (width - 2) * ratio) or 0, height - 2)
+        entry.Fill.Color = ratio >= 0.995 and Color3.fromRGB(55, 230, 85) or Color3.fromRGB(math.floor(235 * (1 - ratio)), math.floor(70 + 185 * ratio), 65)
+        entry.Value.Text = string.format("HP  %d / %d", math.floor(health + 0.5), math.floor(maximum + 0.5))
+        entry.Value.Position = Vector2.new(viewport.X / 2, position.Y - 15)
+        entry.Background.Visible = true
+        entry.Fill.Visible = true
+        entry.Value.Visible = true
+    end)
+end
+
+function NoCrashState:UpdateOverlays()
+    local now = os.clock()
+    if not self.Alive or now - self.LastOverlayUpdate < 0.08 then return end
+    self.LastOverlayUpdate = now
+    pcall(function()
+        self:UpdateTargetMarker()
+        self:UpdateOpponentHealth()
+        self:UpdatePersonalHealth()
+    end)
+end
+
+NoCrashState.ClearEspTrackers = ClearAllEspTrackers
+
+function CycleEvent()
+    local allCharacters = GetAllCharactersInFolder()
+    if not SelectedFolder or not allCharacters then 
+        UpdateTargetCharacters({})
+        return 
+    end
+
+    local localPlayer = game.Players.LocalPlayer
+    local localCharacter = localPlayer.Character
+    local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
+    if not localRoot then return end
+
+    local validCharacters = {}
+
+    for _, char in ipairs(allCharacters) do
+        -- Prevent the script from targeting yourself
+      --  if char == localCharacter then continue end 
+
+        local targetRoot = char:FindFirstChild("HumanoidRootPart")
+        if targetRoot then
+            local distance = (localRoot.Position - targetRoot.Position).Magnitude
+            if distance <= MaxCycleRange then
+                table.insert(validCharacters, { Character = char, Distance = distance })
+            end
+        end
+    end
+    
+    if #validCharacters == 0 then
+        CurrentIndex = 1
+        UpdateTargetCharacters({}) 
+        if not CFG.AutoTargetNearest then  
+            UI_Library:Notify("Cycle", "No targets found in range [".. MaxCycleRange.." studs]")            
+        end
+        return
+    end
+
+    table.sort(validCharacters, function(a, b)
+        return a.Distance < b.Distance
+    end)
+
+    if CFG.MultiTarget then
+        local Max = 3
+        local finalTargets = {}
+        
+        for i = 1, math.min(Max, #validCharacters) do
+            table.insert(finalTargets, validCharacters[i].Character)
+        end
+        
+        UpdateTargetCharacters(finalTargets)
+    else
+        CurrentIndex = (CurrentIndex % #validCharacters) + 1
+        
+        local targetIndex = CFG.AutoTargetNearest and 1 or CurrentIndex
+        local selectedCharacter = validCharacters[targetIndex].Character
+        
+        UpdateTargetCharacters({selectedCharacter})
+    end
+end
+
+-- ==========================================
+-- Input & Loop
+-- ==========================================
+NoCrashState:AddConnection(UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    local RhythmServiceUI = game.Players.LocalPlayer.PlayerGui:FindFirstChild("RhythmServiceUI")
+    if RhythmServiceUI then return end
+
+    if input.KeyCode == CycleKeybind or input.KeyCode == string.byte("x") then
+        CycleEvent()
+    elseif input.KeyCode == string.byte("f") then 
+        local localChar = LocalPlayer.Character
+        LocalTracker:Update(localChar) 
+        OnInputF()
+        --[[if AutoParryToggle.Get() == false and LastPendingRegData then  
+            InputRegisteredTime = os.clock()
+            
+            if (InputRegisteredTime - LastReactionTime) < 1 then  
+                 print("probably on cooldown")
+            end
+            if not LastPendingRegData then return end 
+            local Difference = os.clock() - LastPendingRegData.StartTime
+            local string = string.format("DETECT: You pressed F at %.2f", os.clock() - LastPendingRegData.StartTime)
+--            print(string)
+        --end]]
+    end
+end))
+
+
+
+local UTILITY_TICK = 0.5 -- 2x per second for cycle + ESP logging
+local LastCycleCheck = 0
+
+-- Cached local humanoid (avoids FindFirstChildWhichIsA every frame)
+local _cachedChar, _cachedHum = nil, nil
+local _localReady = false
+local _mainLoopErrAt = 0
+local _lastPruneAt = 0
+
+local function PruneDeadTargets()
+    for i = #TargetCharacters, 1, -1 do
+        local c = TargetCharacters[i]
+        if not characterTrackable(c) then
+            local tracker = EspTrackers[c]
+            if tracker then
+                pcall(function()
+                    if ESP_Utility and ESP_Utility.TrackersToUpdate then
+                        ESP_Utility.TrackersToUpdate[tracker] = nil
+                    end
+                    if tracker.Destroy then tracker:Destroy() end
+                end)
+                EspTrackers[c] = nil
+            end
+            table.remove(TargetCharacters, i)
+        end
+    end
+end
+
+-- Respawn / new character: wipe stale memory track caches so AP works again without reinject
+pcall(function()
+    NoCrashState:AddConnection(LocalPlayer.CharacterAdded:Connect(function(char)
+        _cachedChar, _cachedHum, _localReady = nil, nil, false
+        ResetCombatTrackers("CharacterAdded")
+        task.spawn(function()
+            local hum = char:WaitForChild("Humanoid", 8)
+            if not hum then return end
+            -- Animator can lag behind Humanoid on spawn
+            hum:WaitForChild("Animator", 8)
+            if LocalPlayer.Character == char then
+                _cachedChar = char
+                _cachedHum = hum
+                _localReady = characterTrackable(char)
+            end
+        end)
+    end))
+end)
+
+local function MainLoop()
+    if not NoCrashState.Alive then return end
+
+    local now = os.clock()
+
+    AutoPlayTask()
+
+    local localChar = LocalPlayer.Character
+    if localChar ~= _cachedChar then
+        _cachedChar = localChar
+        _cachedHum = localChar and localChar:FindFirstChildWhichIsA("Humanoid")
+        _localReady = false
+        if localChar then
+            ResetCombatTrackers("character-swap")
+        end
+    end
+    local localHumanoid = _cachedHum
+    if not localHumanoid or localHumanoid.Health <= 0 then
+        _localReady = false
+        scheduler.update()
+        return
+    end
+
+    -- Don't hammer LocalTracker until Animator exists (stops resolve spam + empty AP)
+    if not _localReady then
+        _localReady = characterTrackable(localChar)
+        if not _localReady then
+            scheduler.update()
             return
         end
     end
 
-    -- Source ParryTask: release when past deadline
-    if KeyHeld and ReleaseDeadline > 0 and now >= ReleaseDeadline then
-        BlockEnd()
+    LocalTracker:Update(localChar)
+
+    local ok, err = pcall(EvaluateParryTriggers)
+    if not ok and (now - _mainLoopErrAt) > 2 then
+        _mainLoopErrAt = now
+        warn("[MainLoop] EvaluateParryTriggers: ", err)
+    end
+    ok, err = pcall(ParryTask)
+    if not ok and (now - _mainLoopErrAt) > 2 then
+        _mainLoopErrAt = now
+        warn("[MainLoop] ParryTask: ", err)
     end
 
-    -- Crispy release: parry already registered successfully (game played parry anim on us).
-    -- No reason to keep F held past this — holding = blocking stance = slower movement.
-    -- Releasing here returns full walkspeed in ~50-100ms instead of waiting the full 270ms.
-    if KeyHeld and CurrentParryState == ParryState.PARRYING then
-        BlockEnd()
-    end
+    scheduler.update()
+    NoCrashState:UpdateOverlays()
 
-    -- Stun release: if we got hit, holding F during stun just leaves us visibly locked.
-    -- Release so character returns to normal state as stun ends.
-    if KeyHeld and LocalStunned then
-        BlockEnd()
-    end
-
-    -- Resolution catchall: if the parry attempt resolved to IDLE for ANY reason while F is
-    -- still held, release. Covers ParryFailed anims (our parry failed, we got hit through it),
-    -- Parried anims (counter-parried mid-swing), and any other state-to-IDLE transition.
-    -- Lets AP immediately re-fire on the next incoming hit in a combo instead of being stuck
-    -- holding F from a dead attempt. INPUT_PENDING is intentionally excluded — that's the
-    -- "waiting for parry to register" state, we hold F through it until deadline or detection.
-    if KeyHeld and CurrentParryState == ParryState.IDLE then
-        BlockEnd()
-    end
-
-    -- Early release: F held but attacker can't hit us anymore.
-    -- Covers three cases:
-    --   1. Target despawned (character cleaned up)
-    --   2. Target died (health <= 0)
-    --   3. Target left AP range (dashed/retreated out of reach mid-swing)
-    -- Any of these = release F immediately so we're ready for the next real threat
-    -- instead of standing there blocking a ghost.
-    if KeyHeld and LastPendingRegData and LastPendingRegData.Target then
-        local pendingTarget = LastPendingRegData.Target
-        local shouldRelease = false
-        if not pendingTarget.Parent then
-            shouldRelease = true
-        else
-            local hum = pendingTarget:FindFirstChildWhichIsA("Humanoid")
-            if not hum or hum.Health <= 0 then
-                shouldRelease = true
-            else
-                local hrp = pendingTarget:FindFirstChild("HumanoidRootPart")
-                local lc = LocalPlayer.Character
-                local lr = lc and lc:FindFirstChild("HumanoidRootPart")
-                if hrp and lr then
-                    local d = (lr.Position - hrp.Position).Magnitude
-                    -- 3 stud tolerance: smart gate can fire from APRange+3 on dash-ins,
-                    -- release boundary extends to match so we don't flicker release/press
-                    if d > (CFG.APRange or 10) + 3 then
-                        shouldRelease = true
-                    end
-                end
+    if (now - LastCycleCheck) >= UTILITY_TICK then
+        LastCycleCheck = now
+        -- Drop dead/missing-Animator targets so we don't soft-lock AP on corpses
+        if (now - _lastPruneAt) >= 0.5 then
+            _lastPruneAt = now
+            PruneDeadTargets()
+            -- Soft recovery: if AP is on but local lost trackability, wipe stale memory caches
+            if CFG.AutoParry and _cachedChar and not characterTrackable(_cachedChar) then
+                _localReady = false
+                ResetCombatTrackers("local-untrackable")
             end
         end
-        if shouldRelease then
-            BlockEnd()
+        if CFG.AutoTargetNearest then
+            CycleEvent()
         end
-    end
-
-    -- Rhythm stays on RS for note accuracy (only when enabled)
-    if CFG.RhythmAutoHit then
-        pcall(RhythmAutoHitTick)
-    end
-
-    -- ── AP eval ──
-    if not CFG.Enabled then return end
-    if not AnimTrackerInst then return end
-    -- Early-exit when stunned — can't parry anyway, skip the whole target+anim scan
-    if LocalStunned then return end
-    local lc = LocalPlayer.Character
-    local lr = lc and lc:FindFirstChild("HumanoidRootPart")
-    if not lr then return end
-
-    local apRange = CFG.APRange
-    local doDebug = CFG.Debug
-    local currentActiveIds = {}
-    local targets = TargetCharacters
-    local nTargets = #targets
-
-    for ti = 1, nTargets do
-        local c = targets[ti]
-        if not c.Parent then continue end
-        local tr = c:FindFirstChild("HumanoidRootPart")
-        if not tr then continue end
-        -- Live health check — cycleTargets runs 10Hz so dead targets could linger up to 100ms.
-        -- Attack animations can persist through ragdoll, triggering phantom parries.
-        local hum = c:FindFirstChildWhichIsA("Humanoid")
-        if not hum or hum.Health <= 0 then continue end
-        local dist = (lr.Position - tr.Position).Magnitude
-
-        -- Smart range gate: fire if in reach OR genuinely approaching fast enough to BE in reach soon.
-        -- A static distance cutoff looks sus from far away (nobody human reacts to attacks that
-        -- can't hit them yet). Velocity-aware check catches dash-ins without firing on stationary
-        -- distant targets.
-        if dist > apRange then
-            local toUs = lr.Position - tr.Position
-            local toUsMag = toUs.Magnitude
-            if toUsMag < 0.01 then continue end
-            local closingSpeed = tr.AssemblyLinearVelocity:Dot(toUs / toUsMag)
-            if closingSpeed <= 5 then continue end           -- not approaching
-            local timeToReach = (dist - apRange) / closingSpeed
-            if timeToReach > 0.3 then continue end           -- too far ahead to commit
-            -- Passed: attacker is sprinting into reach, legit read
-        end
-
-        local charKey = tostring(c)
-        local anims = getAnims(c)
-        if doDebug and (now - debugLastPrint) > 2 then
-            debugLastPrint = now
-            print("[Syndicatus DEBUG] targets=" .. nTargets ..
-                " anims=" .. #anims .. " dist=" .. math.floor(dist))
-            for ai = 1, #anims do
-                local a = anims[ai]
-                print("  " .. a.id .. " inDB=" .. tostring(GameConfig[a.id] ~= nil) .. " pos=" .. a.pos)
-            end
-        end
-
-        for ai = 1, #anims do
-            local anim = anims[ai]
-            local animId = anim.id
-            local config = GameConfig[animId]
-            if not config then
-                if doDebug and not UnknownLog[animId] and #UnknownOrder < 500 then
-                    UnknownLog[animId] = true
-                    local num = animId:match("%d+$") or animId:match("%d+")
-                    if num then
-                        UnknownOrder[#UnknownOrder + 1] = num
-                        print("[Syndicatus UNKNOWN]", animId)
-                    end
-                end
-                continue
-            end
-
-            -- Source uses anim.Address; we use character|id
-            local animKey = charKey .. "|" .. animId
-            currentActiveIds[animKey] = true
-
-            local regData = UpdateAnimationRegistry(animKey, animId, now, anim.pos or 0, config, c)
-            if regData.Processed then continue end
-
-            -- WC Fake Wiff: intercept WingChun M2 counter before ForceParry fires
-            if CFG.WCFakeWiff and config.ForceParry and config.Style == "WingChunAnims" then
-                if not regData.FakeWiffDone then
-                    regData.FakeWiffDone = true
-                    regData.Processed = true
-                    doWCFakeWiff(c)
-                    if CFG.Debug then print("[Syndicatus] WC Fake Wiff triggered on", c.Name) end
-                end
-                continue
-            end
-
-            -- ParryFunction first (source order)
-            if TryParryFunction(regData, config, c, animId) then
-                continue
-            end
-
-            -- Direction checks — source skips heavies; uses 0.1 when toggles on
-            do
-                local isHeavy = IsHeavy(config)
-                if not isHeavy and (CFG.TargetFacingYou or CFG.YouFacingTarget) then
-                    local passed = true
-                    local threshold = tonumber(CFG.FacingThreshold) or 0.1
-                    local direction = tr.Position - lr.Position
-                    local mag = direction.Magnitude
-                    if mag >= 0.001 then
-                        direction = direction / mag
-                        if CFG.TargetFacingYou then
-                            if tr.CFrame.LookVector:Dot(-direction) < threshold then
-                                passed = false
-                            end
-                        end
-                        if passed and CFG.YouFacingTarget then
-                            if lr.CFrame.LookVector:Dot(direction) < threshold then
-                                passed = false
-                            end
-                        end
-                    end
-                    if not passed then continue end
-                end
-            end
-
-            -- Probability (source: RandomNum > PTP → mark Processed)
-            local prob = tonumber(CFG.ProbabilityToParry) or 100
-            if regData.RandomNum > prob then
-                regData.Processed = true
-                continue
-            end
-
-            -- Live recompute throttled to every 3rd RS frame.
-            -- At 240Hz: ~12ms refresh — well inside ParryWindow (default 200ms) and jitter headroom.
-            -- LastPendingRegData gate catches post-fire shifts — recompute cannot double-fire.
-            regData._recomputeFrame = (regData._recomputeFrame or 0) + 1
-            if regData._recomputeFrame >= 3 then
-                regData._recomputeFrame = 0
-                local liveBlockStart, liveBlockExpire = CalculateParryTiming(config, regData.StartTime, c)
-                regData.BlockStart = liveBlockStart
-                regData.BlockExpire = liveBlockExpire
-            end
-
-            local BlockExpireTimer = regData.BlockExpire - now
-            if now >= regData.BlockStart and BlockExpireTimer >= 0 then
-                ExecuteParry(regData, config)
-            end
-        end
-    end
-
-    -- Cleanup registry entries whose animations stopped
-    for key, val in pairs(AnimationRegistry) do
-        if not currentActiveIds[key] then
-            -- Anti Feint: fired-upon attack vanished before parry registered → feint, release early
-            if CFG.AntiFeint and KeyHeld and val == AntiFeintTarget and not LocalParrying then
-                local sinceFire = now - AntiFeintFireTime
-                if sinceFire < 0.4 then
-                    BlockEnd()
-                    AntiFeintTarget = nil
-                    if CFG.Debug then
-                        print("[Syndicatus AntiFeint] released F — attack cancelled at " ..
-                            string.format("%.3fs", sinceFire))
-                    end
-                end
-            end
-            if LastPendingRegData == val then
-                LastPendingRegData = nil
-            end
-            if AntiFeintTarget == val then
-                AntiFeintTarget = nil
-            end
-            AnimationRegistry[key] = nil
-        end
-    end
-
-    -- Clear Anti Feint target if we successfully entered PARRYING state
-    if LocalParrying and AntiFeintTarget then
-        AntiFeintTarget = nil
-    end
-end))
-
--- Light utility tick (not on RenderStepped — keeps AP frame clean)
-SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
-    if not SyndicatusState.Alive then return end
-    local now = os.clock()
-
-    -- Ping cache refresh (10Hz) + jitter ring buffer update
-    if (now - lastPingUpdate) >= 0.1 then
-        lastPingUpdate = now
-        CachedPing = GetPingValue()
-        pingSamples[pingSampleIdx] = CachedPing
-        pingSampleIdx = pingSampleIdx % PING_SAMPLE_COUNT + 1
-        local lo, hi = math.huge, -math.huge
-        for i = 1, PING_SAMPLE_COUNT do
-            local v = pingSamples[i]
-            if v < lo then lo = v end
-            if v > hi then hi = v end
-        end
-        pingJitter = hi - lo
-    end
-
-    -- Movement-bias cache (velocity-driven early-fire)
-    do
-        local char = LocalPlayer.Character
-        if char then
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local v = hrp.AssemblyLinearVelocity
-                local horizSpeed = math.sqrt(v.X * v.X + v.Z * v.Z)
-                if horizSpeed > 20 then
-                    cachedMovementBias = -0.015
-                elseif horizSpeed > 8 then
-                    cachedMovementBias = -0.008
-                else
-                    cachedMovementBias = 0
-                end
-            else
-                cachedMovementBias = 0
-            end
-        else
-            cachedMovementBias = 0
-        end
-    end
-
-    -- HB local scan: BACKUP for the event-driven LocalTracker.AnimationAdded detection.
-    -- Primary purpose: clear LocalParrying when parry anim ends (events don't fire on end),
-    -- and safety-clear LocalStunned if nothing is actually stunning us right now (prevents
-    -- the StunToken timer from leaving us flagged if something glitches).
-    if CFG.Enabled then
-        local char = LocalPlayer.Character
-        if char then
-            local anims = getAnims(char)
-            local stillParrying = false
-            local stillStunned = false
-            for i = 1, #anims do
-                local a = anims[i]
-                local id = a and a.id
-                if id then
-                    if animSetHas(ParryingAnimation, id) then stillParrying = true end
-                    if animSetHas(StunnedAnimation, id) then stillStunned = true end
-                end
-            end
-            if LocalParrying and not stillParrying then
-                LocalParrying = false
-            end
-            -- Safety: if nothing is stunning us right now, let the stun flag clear
-            -- instead of waiting the full StunToken duration. Prevents "stuck stunned" bug.
-            if LocalStunned and not stillStunned then
-                LocalStunned = false
-            end
-        end
-    else
-        LocalStunned = false
-        LocalParrying = false
-    end
-
-    -- Auto-respawn
-    if pendingRespawn and CFG.AutoRespawn then
-        local respawnDelay = tonumber(CFG.RespawnDelay) or 1.5
-        if (now - pendingRespawn) >= respawnDelay then
-            pendingRespawn = nil
-            pcall(function() LocalPlayer:LoadCharacter() end)
-        end
-    end
-
-    -- Anti-AFK
-    if CFG.AntiAFK then
-        local afkInterval = tonumber(CFG.AFKInterval) or 240
-        if (now - lastAFKPing) >= afkInterval then
-            lastAFKPing = now
-            pcall(function()
-                keypress(32)
-                keyrelease(32)
-            end)
-        end
-    end
-
-    -- Target cycle — 10Hz for fast new-enemy detection (was 2Hz source default)
-    if (now - lastCycle) >= 0.1 then
-        lastCycle = now
-        pcall(cycleTargets)
-        if TargetLabel then
-            pcall(function()
-                local names = {}
-                for i = 1, #TargetCharacters do
-                    names[#names + 1] = TargetCharacters[i].Name
-                end
-                local pool = #names > 0 and table.concat(names, ", ") or "(none)"
-                TargetLabel:SetText("Locked: " .. pool)
-            end)
-        end
-    end
-end))
-
--- ── UI ──────────────────────────────────────
-if not UI_Library then
-    warn("[Syndicatus] UI library failed — AP still runs headless")
-    menuOpen = false
-    pcall(function() setrobloxinput(true) end)
-    return
-end
-
-local UIRefs = {
-    Armed=nil,AutoDodge=nil,MultiTarget=nil,Debug=nil,
-    CycleRange=nil,APRange=nil,ParryOffset=nil,ParryHold=nil,
-    TargetFacingYou=nil,YouFacingTarget=nil,FacingThreshold=nil,
-    AntiAFK=nil,AFKInterval=nil,AutoRespawn=nil,RespawnDelay=nil,
-}
-
-local function setMenuInput(open)
-    menuOpen = open
-end
-
-local UI_Window = UI_Library:CreateWindow({
-    title="Syndicatus",size=Vector2.new(740,580),configFolder="syndicatus_base",
-    opacity = 1,
-})
-
--- Pure black section/panel fill (kills grey wash)
--- SetPerformance is driven by menu visibility (see syncMenuPerformance below).
-local function applyDarkTheme()
-    pcall(function()
-        if UI_Library.SetOpacity then UI_Library:SetOpacity(1) end
-        if UI_Library.SetTheme then
-            UI_Library:SetTheme({ Background = Color3.fromRGB(0, 0, 0) })
-        end
-    end)
-end
-
--- Menu auto-perf: INS tweens have GPU cost when menu is open.
--- SetPerformance(true) = tweens disabled = faster. We want that when menu is hidden.
-local menuVisible = true
-local function syncMenuPerformance()
-    pcall(function()
-        if UI_Library and UI_Library.SetPerformance then
-            UI_Library:SetPerformance(not menuVisible)
-        end
-    end)
-end
-
--- Input gating: when menu is visible, swallow user's physical keys so they don't
--- leak into the game. Fingers hitting WASD/F while browsing the menu would
--- fight AP's synthetic input and mess up character position. AP keys go through
--- VirtualInputManager which bypasses this entirely — they still fire at full speed.
-local gameInputEnabled = true
-local function applyGameInput()
-    -- PlayerModule controls (WASD / jump / sprint) — survives respawn, re-apply via CharacterAdded hook
-    pcall(function()
-        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
-        if not playerScripts then return end
-        local playerModule = playerScripts:FindFirstChild("PlayerModule")
-        if not playerModule then return end
-        local module = require(playerModule)
-        local controls = module:GetControls()
-        if gameInputEnabled then
-            controls:Enable()
-        else
-            controls:Disable()
-        end
-    end)
-    -- Executor passthrough (keypress/keyrelease from physical keys to game)
-    pcall(function() setrobloxinput(gameInputEnabled) end)
-end
-
-local function setGameInputEnabled(enabled)
-    gameInputEnabled = enabled
-    applyGameInput()
-end
-
--- Re-apply input state on respawn (PlayerModule resets controls on new character)
-pcall(function()
-    LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(0.5)  -- let the character fully load before touching controls
-        applyGameInput()
-    end)
-end)
-
-applyDarkTheme()
-
--- Menu background — INS draws this ABOVE section cards. Keep alpha low so black panels read solid.
-local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/syndicatusAP/main/content.png"
-local function applyMenuBackground()
-    pcall(function()
-        if UI_Library and UI_Library.SetBackgroundImage then
-            UI_Library:SetBackgroundImage(BG_IMAGE_URL, 0.10, 1, 1)
-        end
-    end)
-end
-applyMenuBackground()
-
-local CombatTab   = UI_Window:Tab("Combat","sword")
-local TimingsTab  = UI_Window:Tab("Timings","clock")
-local TechsTab    = UI_Window:Tab("Techs","zap")
-local SettingsTab = UI_Window:Tab("Settings","gear")
-local UpdatesTab  = UI_Window:Tab("Updates","book-closed")
-
-local bindStyle = nil
-local readAPKeybind, writeAPKeybind
-local ProfilesSec = CombatTab:Section("Profiles","Left")
-local EngineSec   = CombatTab:Section("Engine","Left")
-local DebugSec    = CombatTab:Section("Debug","Left")
-local ArmedSec    = CombatTab:Section("Armed","Right")
-local CondSec     = CombatTab:Section("Conditions","Right")
-local TargetSec   = CombatTab:Section("Target Pool","Right")
-
-ProfilesSec:Info("Pick a profile to Load/Save over it, or type a new name then Save.")
-local currentName = "Default"
-local ProfileDrop = nil
-local AnimSliders = {}
-local NameLabel = ProfilesSec:Label("Will save as: "..currentName)
-local ConfigListLabel = nil
-local APKeybindRef = nil
-local _refreshingDrop = false
-
-local function sanitizeName(t)
-    if t == nil then return nil end
-    t = tostring(t):gsub('[/\\:*?"<>|]',""):gsub("^%s+",""):gsub("%s+$",""):sub(1,40)
-    if t == "" then return nil end
-    return t
-end
-
-local function setSaveName(t, silent)
-    local n = sanitizeName(t)
-    if not n then
-        if not silent then UI_Library:Notify("Profiles","Invalid name") end
-        return false
-    end
-    currentName = n
-    pcall(function() NameLabel:SetText("Will save as: "..n) end)
-    return true
-end
-
-local function refreshDrop()
-    if _refreshingDrop then return end
-    _refreshingDrop = true
-    pcall(function()
-        local p = listProfiles()
-        if ProfileDrop then
-            pcall(function() ProfileDrop.Choices = p end)
-            pcall(function() if ProfileDrop.UpdateChoices then ProfileDrop:UpdateChoices(p) end end)
-            pcall(function() if ProfileDrop.Refresh then ProfileDrop:Refresh(p) end end)
-            pcall(function()
-                if ProfileDrop.ClearChoices and ProfileDrop.AddChoice then
-                    ProfileDrop:ClearChoices()
-                    for _, n in ipairs(p) do ProfileDrop:AddChoice(n) end
-                end
-            end)
-            local found = false
-            for _, n in ipairs(p) do if n == selectedConfig then found=true break end end
-            if not found then selectedConfig = p[1] or "Default" end
-            pcall(function() ProfileDrop.Value = {selectedConfig} end)
-        end
-        if ConfigListLabel then
-            local real = {}
-            for _, n in ipairs(p) do if profileSourceMap[n] then table.insert(real,n) end end
-            local msg = (#real==0) and "Saved: (none)" or ("Saved: "..table.concat(real," | "))
-            pcall(function() ConfigListLabel:SetText(msg) end)
-        end
-    end)
-    _refreshingDrop = false
-end
-
-do
-    local made = false
-    for _, method in pairs({"Textbox","Input","TextInput","TextBox"}) do
-        local ok = pcall(function()
-            ProfilesSec[method](ProfilesSec,"Config Name","type name + Enter, then Save",
-                function(t) setSaveName(t, false) end)
-        end)
-        if ok then made=true break end
-    end
-    if not made then
-        ProfilesSec:Info("Textbox unavailable — use clipboard button")
-        ProfilesSec:Button("Set name from clipboard",function()
-            local ok,c = pcall(getclipboard)
-            if ok and c and tostring(c)~="" then
-                setSaveName(c,false)
-                UI_Library:Notify("Profiles","Will save as: "..currentName)
-            else UI_Library:Notify("Profiles","Clipboard empty") end
-        end)
+        ProcessEspAndLogging()
     end
 end
 
-ProfileDrop = ProfilesSec:Dropdown("Load / Delete target",nil,listProfiles,false,function(l)
-    if _refreshingDrop then return end
-    local s = l
-    if type(l)=="table" then s = l[1] or l.Value or l.Selected or l.Name end
-    if type(s)=="string" and #s>0 then
-        selectedConfig = s
-        setSaveName(s, true)
-    end
-end)
-pcall(function()
-    if ProfileDrop and ProfileDrop.SetRefresh then ProfileDrop:SetRefresh(listProfiles) end
-end)
-
-ConfigListLabel = ProfilesSec:Label("Saved: (none)")
-
-local function applySettings(s)
-    if not s then return end
-    local function setSlider(ref,val) if ref and val~=nil then pcall(function() ref:Set(val) end) end end
-    local function setToggle(ref,val) if ref and val~=nil then pcall(function() ref:Set(val) end) end end
-    if s.Enabled     ~=nil then CFG.Enabled=s.Enabled         setToggle(UIRefs.Armed,s.Enabled) end
-    if s.AutoDodge   ~=nil then CFG.AutoDodge=s.AutoDodge     setToggle(UIRefs.AutoDodge,s.AutoDodge) end
-    if s.AutoBoxingM2~=nil then CFG.AutoBoxingM2=s.AutoBoxingM2 setToggle(UIRefs.AutoBoxingM2,s.AutoBoxingM2) end
-    if s.MultiTarget ~=nil then CFG.MultiTarget=s.MultiTarget setToggle(UIRefs.MultiTarget,s.MultiTarget) end
-    if s.Debug       ~=nil then CFG.Debug=s.Debug             setToggle(UIRefs.Debug,s.Debug) end
-    if s.CycleRange        then CFG.CycleRange=s.CycleRange   setSlider(UIRefs.CycleRange,s.CycleRange) end
-    if s.APRange           then CFG.APRange=s.APRange         setSlider(UIRefs.APRange,s.APRange) end
-    if s.ParryOffset ~=nil then CFG.ParryOffset=s.ParryOffset setSlider(UIRefs.ParryOffset,s.ParryOffset) end
-    if s.ProbabilityToParry then CFG.ProbabilityToParry=s.ProbabilityToParry setSlider(UIRefs.ProbabilityToParry,s.ProbabilityToParry) end
-    if s.PingCompensate  ~=nil then CFG.PingCompensate=s.PingCompensate setToggle(UIRefs.PingCompensate,s.PingCompensate) end
-    if s.AutoTargetNearest~=nil then CFG.AutoTargetNearest=s.AutoTargetNearest setToggle(UIRefs.AutoTargetNearest,s.AutoTargetNearest) end
-    if s.RhythmAutoHit   ~=nil then CFG.RhythmAutoHit=s.RhythmAutoHit setToggle(UIRefs.RhythmAutoHit,s.RhythmAutoHit) end
-    -- Facing conditions
-    if s.TargetFacingYou ~=nil then CFG.TargetFacingYou=s.TargetFacingYou setToggle(UIRefs.TargetFacingYou,s.TargetFacingYou) end
-    if s.YouFacingTarget ~=nil then CFG.YouFacingTarget=s.YouFacingTarget  setToggle(UIRefs.YouFacingTarget,s.YouFacingTarget) end
-    if s.AutoHeight      ~=nil then CFG.AutoHeight=s.AutoHeight            setToggle(UIRefs.AutoHeight,s.AutoHeight) end
-    if s.HeightInfluence ~=nil then CFG.HeightInfluence=s.HeightInfluence  setSlider(UIRefs.HeightInfluence,s.HeightInfluence) end
-    -- Tech pack
-    if s.AntiFeint     ~=nil then CFG.AntiFeint=s.AntiFeint             setToggle(UIRefs.AntiFeint,s.AntiFeint) end
-    if s.CritDefense   ~=nil then CFG.CritDefense=s.CritDefense         setToggle(UIRefs.CritDefense,s.CritDefense) end
-    if s.WCFakeWiff    ~=nil then CFG.WCFakeWiff=s.WCFakeWiff           setToggle(UIRefs.WCFakeWiff,s.WCFakeWiff) end
-    if s.WCFakeWiffTime      then CFG.WCFakeWiffTime=s.WCFakeWiffTime   setSlider(UIRefs.WCFakeWiffTime,s.WCFakeWiffTime) end
-    if s.ShadowStep    ~=nil then CFG.ShadowStep=s.ShadowStep           setToggle(UIRefs.ShadowStep,s.ShadowStep) end
-    if s.ShadowCrit    ~=nil then CFG.ShadowCrit=s.ShadowCrit           setToggle(UIRefs.ShadowCrit,s.ShadowCrit) end
-    -- Misc
-    if s.SoundOnParry    ~=nil then CFG.SoundOnParry=s.SoundOnParry end
-    if s.AntiAFK         ~=nil then CFG.AntiAFK=s.AntiAFK                 setToggle(UIRefs.AntiAFK,s.AntiAFK) end
-    if s.AFKInterval           then CFG.AFKInterval=s.AFKInterval           setSlider(UIRefs.AFKInterval,s.AFKInterval) end
-    if s.AutoRespawn     ~=nil then CFG.AutoRespawn=s.AutoRespawn          setToggle(UIRefs.AutoRespawn,s.AutoRespawn) end
-    if s.RespawnDelay          then CFG.RespawnDelay=s.RespawnDelay         setSlider(UIRefs.RespawnDelay,s.RespawnDelay) end
-    if s.DefaultRT             then DefaultRT=s.DefaultRT end
-    if s.APKeybind then pcall(function() writeAPKeybind(s.APKeybind) end) end
-    if s.AutoParryRange then CFG.APRange=s.AutoParryRange setSlider(UIRefs.APRange,s.AutoParryRange) end
+NoCrashState:AddConnection(RunService.RenderStepped:Connect(MainLoop))
 end
-
-ProfilesSec:Button("Save Current",function()
-    -- Save target: dropdown selection if it's a real writable profile, else the typed name
-    local name = nil
-    if type(selectedConfig) == "string"
-        and selectedConfig ~= ""
-        and selectedConfig ~= "Default" then
-        name = sanitizeName(selectedConfig)
-    end
-    if not name then
-        name = sanitizeName(currentName)
-    end
-    if not name and selectedConfig == "Default" and currentName == "Default" then
-        name = "Default"
-    end
-    if not name then
-        UI_Library:Notify("Profiles", "Type a config name first (then Enter), or pick a profile")
-        return
-    end
-    currentName = name
-    selectedConfig = name
-    local t = {}
-    for id,info in pairs(GameConfig) do t[id]=info.ReactionTime or DefaultRT end
-    local kb = "g"
-    pcall(function()
-        if APToggleElement and APToggleElement.Bind and type(APToggleElement.Bind.Value) == "string"
-            and #APToggleElement.Bind.Value > 0 and APToggleElement.Bind.Value ~= "none" then
-            kb = APToggleElement.Bind.Value
-        elseif readAPKeybind then
-            kb = readAPKeybind() or kb
-        end
-    end)
-    CFG.APKeybind = tostring(kb):lower()
-    local payload = {
-        Timings=t,
-        Settings={
-            Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
-            MultiTarget=CFG.MultiTarget,
-            Debug=CFG.Debug,
-            TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
-            AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
-            AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
-            WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
-            ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
-            CycleRange=CFG.CycleRange, APRange=CFG.APRange,
-            ParryOffset=CFG.ParryOffset,  -- Hold+Window hard-locked; not saved
-            ProbabilityToParry=CFG.ProbabilityToParry,
-            PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
-            RhythmAutoHit=CFG.RhythmAutoHit,
-            DefaultRT=DefaultRT, APKeybind=CFG.APKeybind,
-            SoundOnParry=CFG.SoundOnParry,
-            AntiAFK=CFG.AntiAFK, AFKInterval=CFG.AFKInterval,
-            AutoRespawn=CFG.AutoRespawn, RespawnDelay=CFG.RespawnDelay,
-            AutoParryRange=CFG.APRange,
-        },
-    }
-    local savedPath = saveProfile(name,payload)
-    if not savedPath then UI_Library:Notify("Profiles","Save FAILED") return end
-    print("[Syndicatus] Saved profile", name, "APKeybind=", CFG.APKeybind)
-    selectedConfig = name
-    pcall(function() NameLabel:SetText("Will save as: "..name) end)
-    refreshDrop()
-    UI_Library:Notify("Profiles","Saved: "..name.."  (AP key: "..tostring(CFG.APKeybind)..")")
-end)
-
-ProfilesSec:Button("Load Selected",function()
-    if not selectedConfig or selectedConfig=="" then
-        UI_Library:Notify("Profiles","Pick a config in the dropdown first") return
-    end
-    if selectedConfig=="Default" and not profileSourceMap["Default"] then
-        for id,info in pairs(GameConfig) do
-            local orig=FlatConfig[id]
-            if orig then info.ReactionTime=orig.ReactionTime or DefaultRT end
-        end
-        if bindStyle then pcall(bindStyle,currentStyleEdit) end
-        UI_Library:Notify("Profiles","Loaded built-in Default timings") return
-    end
-    local data = loadProfile(selectedConfig)
-    if not data then UI_Library:Notify("Profiles","Load failed: "..tostring(selectedConfig)) return end
-    local n = 0
-    if data.Timings then
-        for id,rt in pairs(data.Timings) do
-            local key = tostring(id)
-            if not key:find("rbxassetid://",1,true) then key="rbxassetid://"..key end
-            if GameConfig[key] then GameConfig[key].ReactionTime=tonumber(rt) or 0.1 n+=1 end
-        end
-    end
-    applySettings(data.Settings or data)
-    setSaveName(selectedConfig,true)
-    if bindStyle then pcall(bindStyle,currentStyleEdit) end
-    local loadedKb = tostring(CFG.APKeybind or "?")
-    UI_Library:Notify("Profiles","Loaded: "..selectedConfig.." ("..n.." timings, AP key: "..loadedKb..")")
-end)
-
-ProfilesSec:Button("Delete Selected",function()
-    if not selectedConfig or selectedConfig=="" then UI_Library:Notify("Profiles","Nothing selected") return end
-    if selectedConfig=="Default" and not profileSourceMap["Default"] then
-        UI_Library:Notify("Profiles","Default is built-in") return
-    end
-    if not profileSourceMap[selectedConfig] then
-        UI_Library:Notify("Profiles","Not a saved file: "..tostring(selectedConfig)) return
-    end
-    local deletedName = selectedConfig
-    deleteProfile(selectedConfig)
-    selectedConfig = "Default"
-    setSaveName("Default",true)
-    refreshDrop()
-    UI_Library:Notify("Profiles","Deleted: "..deletedName)
-end)
-
-ProfilesSec:Button("Refresh List",function()
-    refreshDrop() UI_Library:Notify("Profiles","List refreshed")
-end)
-
-ProfilesSec:Button("Reset Timings (built-in)",function()
-    for id,info in pairs(GameConfig) do
-        local orig=FlatConfig[id]
-        if orig then info.ReactionTime=orig.ReactionTime or DefaultRT end
-    end
-    if bindStyle then pcall(bindStyle,currentStyleEdit) end
-    UI_Library:Notify("Profiles","Timings reset")
-end)
-
--- ── Config sharing ──
-ProfilesSec:Divider("Share")
-ProfilesSec:Info("Export your timings+settings to clipboard, or import someone else's")
-
-local function buildSharePayload()
-    local kb = "g"
-    pcall(function()
-        if APToggleElement and APToggleElement.Bind and type(APToggleElement.Bind.Value) == "string"
-            and #APToggleElement.Bind.Value > 0 and APToggleElement.Bind.Value ~= "none" then
-            kb = APToggleElement.Bind.Value
-        elseif readAPKeybind then
-            kb = readAPKeybind() or kb
-        end
-    end)
-    CFG.APKeybind = tostring(kb):lower()
-    local t = {}
-    for id, info in pairs(GameConfig) do t[id] = info.ReactionTime or DefaultRT end
-    return {
-        _format = "syndicatus-share-v1",  -- importer also accepts legacy "olympus-share-v1"
-        Timings = t,
-        Settings = {
-            Enabled=CFG.Enabled, AutoDodge=CFG.AutoDodge, AutoBoxingM2=CFG.AutoBoxingM2,
-            MultiTarget=CFG.MultiTarget, Debug=CFG.Debug,
-            TargetFacingYou=CFG.TargetFacingYou, YouFacingTarget=CFG.YouFacingTarget,
-            AutoHeight=CFG.AutoHeight, HeightInfluence=CFG.HeightInfluence,
-            AntiFeint=CFG.AntiFeint, CritDefense=CFG.CritDefense,
-            WCFakeWiff=CFG.WCFakeWiff, WCFakeWiffTime=CFG.WCFakeWiffTime,
-            ShadowStep=CFG.ShadowStep, ShadowCrit=CFG.ShadowCrit,
-            CycleRange=CFG.CycleRange, APRange=CFG.APRange,
-            ParryOffset=CFG.ParryOffset,  -- Hold+Window hard-locked; not saved
-            ProbabilityToParry=CFG.ProbabilityToParry,
-            PingCompensate=CFG.PingCompensate, AutoTargetNearest=CFG.AutoTargetNearest,
-            RhythmAutoHit=CFG.RhythmAutoHit,
-            DefaultRT=DefaultRT, APKeybind=CFG.APKeybind,
-            SoundOnParry=CFG.SoundOnParry,
-            AntiAFK=CFG.AntiAFK, AFKInterval=CFG.AFKInterval,
-            AutoRespawn=CFG.AutoRespawn, RespawnDelay=CFG.RespawnDelay,
-            AutoParryRange=CFG.APRange,
-        },
-    }
-end
-
-local function applyShared(data)
-    local tApplied, tMissing = 0, 0
-    if type(data.Timings) == "table" then
-        for id, rt in pairs(data.Timings) do
-            local key = tostring(id)
-            if not key:find("rbxassetid://", 1, true) then key = "rbxassetid://" .. key end
-            if GameConfig[key] then
-                GameConfig[key].ReactionTime = tonumber(rt) or 0.1
-                tApplied = tApplied + 1
-            else
-                tMissing = tMissing + 1
-            end
-        end
-    end
-    local sApplied = 0
-    if type(data.Settings) == "table" then
-        applySettings(data.Settings)
-        for _ in pairs(data.Settings) do sApplied = sApplied + 1 end
-    end
-    if bindStyle then pcall(bindStyle, currentStyleEdit) end
-    return tApplied, tMissing, sApplied
-end
-
-ProfilesSec:Button("Export to Clipboard", function()
-    local ok, err = pcall(function()
-        local payload = buildSharePayload()
-        local json = HttpService:JSONEncode(payload)
-        setclipboard(json)
-    end)
-    if ok then
-        UI_Library:Notify("Share", "Copied — paste to send")
-    else
-        UI_Library:Notify("Share", "Export failed: " .. tostring(err))
-    end
-end)
-
-ProfilesSec:Button("Import from Clipboard", function()
-    local ok, text = pcall(getclipboard)
-    if not ok or type(text) ~= "string" or text == "" then
-        UI_Library:Notify("Share", "Clipboard empty or unreadable")
-        return
-    end
-    local okJ, data = pcall(function() return HttpService:JSONDecode(text) end)
-    if not okJ or type(data) ~= "table" then
-        UI_Library:Notify("Share", "Clipboard isn't valid Syndicatus JSON")
-        return
-    end
-    local tApplied, tMissing, sApplied = applyShared(data)
-    UI_Library:Notify("Share", string.format(
-        "Imported %d timings (%d skipped), %d settings", tApplied, tMissing, sApplied))
-end)
-
-local pendingUrl = ""
-do
-    local made = false
-    for _, method in pairs({"Textbox","Input","TextInput","TextBox"}) do
-        local ok = pcall(function()
-            ProfilesSec[method](ProfilesSec,"Import URL","raw gist/pastebin URL + Enter",
-                function(t) pendingUrl = tostring(t or "") end)
-        end)
-        if ok then made = true break end
-    end
-    if not made then
-        ProfilesSec:Info("Textbox unavailable — use clipboard import instead")
-    end
-end
-ProfilesSec:Button("Fetch & Load URL", function()
-    local url = pendingUrl
-    if not url or url == "" then
-        UI_Library:Notify("Share", "Type a URL in the Import URL field first")
-        return
-    end
-    local okFetch, body = pcall(function() return game:HttpGet(url) end)
-    if not okFetch or type(body) ~= "string" or body == "" then
-        UI_Library:Notify("Share", "Fetch failed — check URL + executor HttpGet permission")
-        return
-    end
-    local okJ, data = pcall(function() return HttpService:JSONDecode(body) end)
-    if not okJ or type(data) ~= "table" then
-        UI_Library:Notify("Share", "URL did not return valid Syndicatus JSON")
-        return
-    end
-    local tApplied, tMissing, sApplied = applyShared(data)
-    UI_Library:Notify("Share", string.format(
-        "Loaded from URL: %d timings (%d skipped), %d settings", tApplied, tMissing, sApplied))
-end)
-
--- Armed
-ArmedSec:Info("Auto-targets nearby players every 0.5s")
--- INS stores the bind on the ROW: toggle.Bind = { Value = "g", Mode = "Toggle", ... }
-local APToggleElement = ArmedSec:Toggle("Auto Parry", true, function(v)
-    CFG.Enabled = v and true or false
-end)
-UIRefs.Armed = APToggleElement
-
-pcall(function()
-    APToggleElement:AddKeybind(tostring(CFG.APKeybind or "g"):lower(), "Toggle")
-end)
-
-UIRefs.AutoDodge = ArmedSec:Toggle("Auto Dodge Heavy", true, function(v) CFG.AutoDodge = v end)
-UIRefs.AutoBoxingM2 = ArmedSec:Toggle("Auto Boxing M2", true, function(v)
-    CFG.AutoBoxingM2 = v
-    pcall(function()
-        UI_Library:Notify("Boxing M2", v and "AP will handle Boxing M2" or "Manual — AP ignores Boxing M2")
-    end)
-end)
-ArmedSec:Info("OFF = you parry/dodge Boxing M2 yourself. ON = AP block→dodge sequence.")
-UIRefs.MultiTarget = ArmedSec:Toggle("Multiple Targets", true, function(v) CFG.MultiTarget = v end)
-UIRefs.AutoTargetNearest = ArmedSec:Toggle("Auto Target Nearest", true, function(v) CFG.AutoTargetNearest = v end)
-
-readAPKeybind = function()
-    local k = nil
-    pcall(function()
-        if APToggleElement and APToggleElement.Bind and type(APToggleElement.Bind.Value) == "string" then
-            k = APToggleElement.Bind.Value
-        end
-    end)
-    if type(k) == "string" and #k > 0 and k ~= "none" then
-        CFG.APKeybind = k
-        return k
-    end
-    return tostring(CFG.APKeybind or "g")
-end
-
-writeAPKeybind = function(key)
-    if not key or key == "" then return end
-    local s = tostring(key):gsub("%s+", ""):lower()
-    if s == "" then return end
-    CFG.APKeybind = s
-    pcall(function()
-        if APToggleElement and APToggleElement.Bind then
-            APToggleElement.Bind.Value = s
-            APToggleElement.Bind.Mode = "Toggle"
-        elseif APToggleElement and APToggleElement.AddKeybind then
-            APToggleElement:AddKeybind(s, "Toggle")
-        end
-    end)
-end
-
--- Sync CFG from pill so Save always has the current key
-SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
-    if not SyndicatusState.Alive then return end
-    local t = os.clock()
-    if (SyndicatusState._lastKbSync or 0) + 0.5 > t then return end
-    SyndicatusState._lastKbSync = t
-    pcall(function()
-        if APToggleElement and APToggleElement.Bind then
-            local k = APToggleElement.Bind.Value
-            if type(k) == "string" and #k > 0 and k ~= "none" then
-                CFG.APKeybind = k
-            end
-            if APToggleElement.Bind.Mode and APToggleElement.Bind.Mode ~= "Toggle" then
-                APToggleElement.Bind.Mode = "Toggle"
-            end
-        end
-    end)
-end))
-
-CondSec:Info("Gate parry per target based on facing direction")
-UIRefs.TargetFacingYou=CondSec:Toggle("Target facing you",false,function(v) CFG.TargetFacingYou=v end)
-UIRefs.YouFacingTarget=CondSec:Toggle("You facing target",true,function(v) CFG.YouFacingTarget=v end)
-CondSec:Info("Facing angle locked to source default (0.1 dot)")
-UIRefs.AutoHeight = CondSec:Toggle("Automatic Height Timing", true, function(v) CFG.AutoHeight = v end)
-UIRefs.HeightInfluence = CondSec:Slider("Height Influence", 1, 0.05, 0, 2, "x", function(v) CFG.HeightInfluence = tonumber(v) or 1 end)
-UIRefs.HeightInfluence:Set(1)
-CondSec:Info("BodyHeightScale only. 1x = full effect")
-
-TargetLabel = TargetSec:Label("Locked: (none)")
-UIRefs.CycleRange = TargetSec:Slider("Cycle Range",20,1,5,60,"studs",function(v) CFG.CycleRange=v end)
-UIRefs.CycleRange:Set(CFG.CycleRange)
-UIRefs.APRange = TargetSec:Slider("AP Range",11,1,5,60,"studs",function(v) CFG.APRange=v end)
-UIRefs.APRange:Set(11)
-TargetSec:Info("Primary parry range — kept tight so AP doesn't fire sus from far away")
-TargetSec:Info("Smart gate still fires on fast-approaching attackers within 0.3s of reach")
-
-UIRefs.Debug = EngineSec:Toggle("Debug Parry",false,function(v)
-    CFG.Debug=v
-    if v then UI_Library:Notify("Debug ON","Will notify + print each parry fire") end
-end)
-UIRefs.ParryOffset = EngineSec:Slider("Parry Offset",0,0.001,-0.15,0.15,"s",function(v) CFG.ParryOffset=tonumber(v) or 0 end)
-UIRefs.ParryOffset:Set(0)
-UIRefs.ProbabilityToParry = EngineSec:Slider("Probability To Parry",100,1,1,100,"%",function(v) CFG.ProbabilityToParry=tonumber(v) or 100 end)
-UIRefs.ProbabilityToParry:Set(100)
-UIRefs.PingCompensate = EngineSec:Toggle("Ping Compensation", true, function(v) CFG.PingCompensate=v end)
-EngineSec:Info("Ping Comp subtracts half your ping from reaction time.")
-EngineSec:Info("Hold=0.27s / Window=0.20s locked to source defaults.")
-EngineSec:Info("Continuous registry (no global CD).")
-
-DebugSec:Label("Enable Debug Parry to see prints + notifs")
-DebugSec:Button("Copy Unknown IDs",function()
-    if #UnknownOrder==0 then UI_Library:Notify("Debug","None logged") return end
-    setclipboard(table.concat(UnknownOrder,","))
-    UI_Library:Notify("Debug","Copied "..#UnknownOrder.." unknown IDs")
-end)
-DebugSec:Button("Clear Unknown Log",function()
-    table.clear(UnknownLog) table.clear(UnknownOrder)
-    UI_Library:Notify("Debug","Cleared")
-end)
-DebugSec:Button("Flush Registry",function()
-    table.clear(AnimationRegistry)
-    LastPendingRegData = nil
-    UI_Library:Notify("Debug","Registry flushed")
-end)
-
--- ── Timings Tab ──────────────────────────────
-local StylePickSec   = TimingsTab:Section("Style Editor","Left")
-local StyleSliderSec = TimingsTab:Section("Reaction Times","Right")
-
-local styleNames = {} local stylesSeen = {}
-for _,info in pairs(GameConfig) do
-    if info.Style and not stylesSeen[info.Style] then
-        stylesSeen[info.Style]=true table.insert(styleNames,info.Style)
-    end
-end
-table.sort(styleNames)
-
-local currentStyleEdit = styleNames[1] or "KarateAnims"
-local MAX_SLOTS = 16
-local slots = {}
-local StyleTitleLabel = nil
-local StyleHintLabel  = nil
-
-for i = 1, MAX_SLOTS do
-    local slotIndex = i
-    local sl = StyleSliderSec:Slider("—",0,0.001,0,1,"s",function(v)
-        local s = slots[slotIndex]
-        if s and s.boundInfo then s.boundInfo.ReactionTime=v end
-    end)
-    sl:Set(0)
-    slots[i] = {slider=sl, boundId=nil, boundInfo=nil, name="—"}
-end
-
-local function setSlotName(slot, text)
-    local sl = slot.slider
-    for _,m in pairs({"SetText","SetName","SetTitle","SetLabel"}) do
-        pcall(function() if sl[m] then sl[m](sl,text) end end)
-    end
-    for _,p in pairs({"Title","Name","Text"}) do
-        pcall(function() if rawget(sl,p)~=nil then sl[p]=text end end)
-    end
-    slot.name = text
-end
-
-bindStyle = function(styleName)
-    if not styleName or styleName=="" then return end
-    currentStyleEdit = styleName
-    local collected = {}
-    for id,info in pairs(GameConfig) do
-        if info.Style==styleName then table.insert(collected,{id=id,info=info}) end
-    end
-    table.sort(collected, function(a, b)
-        local function rank(name)
-            name = tostring(name or "")
-            if name:find("%(A%)") then return 2, name end
-            if name:find("%(B%)") then return 3, name end
-            if name:find("Feint") then return 4, name end
-            return 1, name
-        end
-        local ra, na = rank(a.info.DisplayName)
-        local rb, nb = rank(b.info.DisplayName)
-        if ra ~= rb then return ra < rb end
-        return na < nb
-    end)
-    local nice = styleName:gsub("Anims","")
-    if StyleTitleLabel then pcall(function() StyleTitleLabel:SetText("EDITING: "..nice.."  ("..#collected.." anims)") end) end
-    if StyleHintLabel  then pcall(function() StyleHintLabel:SetText("Right side shows "..nice.." only") end) end
-    for i=1,MAX_SLOTS do
-        local slot=slots[i] local entry=collected[i]
-        if entry then
-            slot.boundId=entry.id slot.boundInfo=entry.info
-            AnimSliders[entry.id]=slot.slider
-            local label=entry.info.DisplayName or ("Anim "..i)
-            if entry.info.Heavy then label=label.." [HEAVY]" end
-            setSlotName(slot,label)
-            pcall(function() slot.slider:Set(entry.info.ReactionTime or DefaultRT) end)
-            pcall(function() if slot.slider.SetVisible then slot.slider:SetVisible(true) end end)
-        else
-            slot.boundId=nil slot.boundInfo=nil
-            setSlotName(slot,"—") pcall(function() slot.slider:Set(0) end)
-            pcall(function() if slot.slider.SetVisible then slot.slider:SetVisible(false) end end)
-        end
-    end
-    UI_Library:Notify("Timings","Now editing: "..nice)
-end
-
-StylePickSec:Info("Click a style → right side shows ONLY that style")
-StyleTitleLabel = StylePickSec:Label("EDITING: —")
-StyleHintLabel  = StylePickSec:Label("Pick a style below")
-StylePickSec:Slider("Default RT",DefaultRT,0.001,0,0.5,"s",function(v) DefaultRT=v end):Set(DefaultRT)
-StylePickSec:Button("Reset Current Style",function()
-    for i=1,MAX_SLOTS do
-        local slot=slots[i]
-        if slot.boundId and FlatConfig[slot.boundId] then
-            local rt=FlatConfig[slot.boundId].ReactionTime or DefaultRT
-            slot.boundInfo.ReactionTime=rt pcall(function() slot.slider:Set(rt) end)
-        end
-    end
-    UI_Library:Notify("Timings","Reset "..(currentStyleEdit:gsub("Anims","") or "?"))
-end)
-StylePickSec:Info("--- Styles ---")
-do
-    local COLS = 3
-    local i = 1
-    while i <= #styleNames do
-        local s1 = styleNames[i]
-        local row = StylePickSec:Button(s1:gsub("Anims",""), function() bindStyle(s1) end)
-        for c = 1, COLS - 1 do
-            local idx = i + c
-            if idx <= #styleNames and row and row.AddButton then
-                local sN = styleNames[idx]
-                pcall(function()
-                    row:AddButton(sN:gsub("Anims",""), function() bindStyle(sN) end)
-                end)
-            end
-        end
-        i = i + COLS
-    end
-end
-bindStyle(currentStyleEdit)
-
--- ── Techs Tab ────────────────────────
-local AntiFeintSec = TechsTab:Section("Anti Feint","Left")
-local CritDefSec   = TechsTab:Section("Crit Defense","Left")
-local WCFakeSec    = TechsTab:Section("Wing Chun Fake Wiff","Right")
-local ShadowSec    = TechsTab:Section("Shadow Techs","Right")
-
-AntiFeintSec:Info("Releases F if the fired-upon attack cancels before parry registers")
-UIRefs.AntiFeint = AntiFeintSec:Toggle("Anti Feint", false, function(v) CFG.AntiFeint = v end)
-AntiFeintSec:Info("Protects against feint bait — detection window is 400ms post-fire")
-
-CritDefSec:Info("Randomizes F / Q (50/50) on Heavy / M2 attacks. Overrides Auto Dodge when on.")
-UIRefs.CritDefense = CritDefSec:Toggle("Crit Defense", false, function(v) CFG.CritDefense = v end)
-CritDefSec:Info("Breaks pattern reads where opponent expects pure dodge on crits")
-
-WCFakeSec:Info("On WingChun M2 (counter), rotates away + fires M1 so your M1 whiffs,")
-WCFakeSec:Info("baiting their counter to activate on empty air")
-UIRefs.WCFakeWiff = WCFakeSec:Toggle("WC Counter Fake Wiff", false, function(v) CFG.WCFakeWiff = v end)
-UIRefs.WCFakeWiffTime = WCFakeSec:Slider("Fake Wiff Time",0.18,0.01,0.05,0.4,"s",function(v)
-    CFG.WCFakeWiffTime = tonumber(v) or 0.18
-end)
-UIRefs.WCFakeWiffTime:Set(0.18)
-WCFakeSec:Info("Duration of the rotation before snapping back")
-
-ShadowSec:Info("Z = Shadow Step | B = Shadow Crit")
-ShadowSec:Info("Both press F+Q rapidly (3 taps, ~40ms each)")
-UIRefs.ShadowStep = ShadowSec:Toggle("Shadow Step (Z)", false, function(v) CFG.ShadowStep = v end)
-UIRefs.ShadowCrit = ShadowSec:Toggle("Shadow Crit (B)", false, function(v) CFG.ShadowCrit = v end)
-
--- ── Settings Tab ────────────────────────────
-local MiscSec     = SettingsTab:Section("Misc","Left")
-local AntiAFKSec  = SettingsTab:Section("Anti-AFK","Left")
-local RespawnSec  = SettingsTab:Section("Auto Respawn","Right")
-local SessionSec  = SettingsTab:Section("Session","Right")
-
-MiscSec:Info("Misc quality-of-life options")
-MiscSec:Toggle("Sound on Parry",false,function(v) CFG.SoundOnParry=v end)
-MiscSec:Info("Plays a click sound each time F is pressed")
-UIRefs.RhythmAutoHit = MiscSec:Toggle("Rhythm Auto-Hit", false, function(v)
-    CFG.RhythmAutoHit = v
-    UI_Library:Notify("Rhythm Auto-Hit", v and "ON — set keys to Z X , . (4) or F J (2)" or "OFF")
-end)
-MiscSec:Info("Requires Gakuran keybinds: 4-lane = Z X Comma Period | 2-lane = F J")
-MiscSec:Button("Unload Syndicatus",function()
-    pcall(function()
-        if _G.__SyndicatusAP and _G.__SyndicatusAP.Cleanup then
-            _G.__SyndicatusAP:Cleanup()
-        else
-            UI_Window:Destroy()
-        end
-    end)
-    print("[Syndicatus] Unloaded")
-end)
-
-AntiAFKSec:Info("Jumps every N seconds to prevent AFK kick")
-UIRefs.AntiAFK = AntiAFKSec:Toggle("Anti-AFK",false,function(v)
-    CFG.AntiAFK=v
-    lastAFKPing=os.clock()
-    UI_Library:Notify("Anti-AFK", v and "Enabled — jumping every "..CFG.AFKInterval.."s" or "Disabled")
-end)
-UIRefs.AFKInterval = AntiAFKSec:Slider("AFK Interval",240,1,60,600,"s",function(v)
-    CFG.AFKInterval=tonumber(v) or 240
-end)
-UIRefs.AFKInterval:Set(240)
-AntiAFKSec:Info("60s min — 600s max. Default 240s (4 min)")
-
-RespawnSec:Info("Respawns you automatically after death")
-UIRefs.AutoRespawn = RespawnSec:Toggle("Auto Respawn",false,function(v)
-    CFG.AutoRespawn=v
-    UI_Library:Notify("Auto Respawn", v and "Enabled — "..CFG.RespawnDelay.."s delay" or "Disabled")
-end)
-UIRefs.RespawnDelay = RespawnSec:Slider("Respawn Delay",1.5,0.5,0.5,5,"s",function(v)
-    CFG.RespawnDelay=tonumber(v) or 1.5
-end)
-UIRefs.RespawnDelay:Set(1.5)
-RespawnSec:Info("Delay before respawn triggers. Lower = faster.")
-RespawnSec:Button("Force Respawn Now",function()
-    pcall(function() LocalPlayer:LoadCharacter() end)
-    UI_Library:Notify("Respawn","Forced respawn")
-end)
-
-local ParryCountLabel = SessionSec:Label("Parries this session: 0")
-SessionSec:Info("Tracks parries fired since inject")
-SessionSec:Button("Reset Counter",function()
-    parryCount=0
-    pcall(function() ParryCountLabel:SetText("Parries this session: 0") end)
-end)
-
-local _lastCountUpdate = 0
-SyndicatusState:AddConnection(RunService.Heartbeat:Connect(function()
-    local now2 = os.clock()
-    if (now2-_lastCountUpdate) > 1 then
-        _lastCountUpdate=now2
-        pcall(function() ParryCountLabel:SetText("Parries this session: "..parryCount) end)
-    end
-end))
-
-local UpdatesSec = UpdatesTab:Section("UPDATES","Left")
-local SoonSec    = UpdatesTab:Section("COMING SOON","Right")
-
--- ── v9.4.38 ──
-UpdatesSec:Divider("v9.4.38 — Peak-Tracked Hold Detection")
-UpdatesSec:Info("Fixes swap-cuts-hold-short and missed-tap-after-hold without regressing holds")
-UpdatesSec:Label("Per-note peak posDelta classifies hold vs tap at PRESS and tracks live")
-UpdatesSec:Label("hold-done: peak ≥ 80 AND posDelta ≤ 55 AND held ≥ 0.12s")
-UpdatesSec:Label("tap-done: peak < 80 AND |headY - recY| > 15")
-UpdatesSec:Label("Swap guard: refuses swap while live hold still has trail (posDelta > 55)")
-UpdatesSec:Label("Safety: 10s force release for stuck keys across song boundaries")
-
--- ── v9.4.37 ──
-UpdatesSec:Divider("v9.4.37 — Full Revert to Hold-on-Despawn")
-UpdatesSec:Label("Restored v9.4.30 model. Early release attempts broke holds.")
-
--- ── v9.4.36 ──
-UpdatesSec:Divider("v9.4.36 — Crisp Hold End")
-UpdatesSec:Info("Log proved: hold Head parks at recY, posDelta falls 426→0")
-UpdatesSec:Label("RELEASE hold-done when posDelta ≤ 55 after peak ≥ 80")
-UpdatesSec:Label("RELEASE tap-done when Head past receptor (no wait despawn)")
-UpdatesSec:Label("Never swap while a real hold still has trail (posDelta > 55)")
-UpdatesSec:Label("Despawn / lost-track still safety-net")
-
--- ── v9.4.35 ──
-UpdatesSec:Divider("v9.4.35 — Hold Rollback")
-UpdatesSec:Info("v9.4.32–34 early-release logic stopped holds from holding")
-UpdatesSec:Label("Restored v9.4.30 model that actually kept the key down")
-UpdatesSec:Label("PRESS when Head near receptor | HOLD until note despawns")
-UpdatesSec:Label("No trail-gone / shrink release — those cut holds short")
-UpdatesSec:Label("Still: exclude held note from candidates, swap = release+press")
-
--- ── v9.4.34 ──
-UpdatesSec:Divider("v9.4.34 — Early Hold Release (other-lane after pause)")
-UpdatesSec:Info("Same-timing hold+tap (multi-lane) worked; hold → pause → other-lane TAP missed")
-UpdatesSec:Label("Hold key stayed down until despawn — blocked later input on some setups")
-UpdatesSec:Info("Fix")
-UpdatesSec:Label("Release when trail shrinks to ~35% of peak (hold-shrunk) — early into the pause")
-UpdatesSec:Label("Still release at baseline (hold-trail-gone) and despawn")
-UpdatesSec:Label("lost-track: if held note stops matching, release immediately")
-UpdatesSec:Label("Other lanes were always independent keys — early release unblocks them")
-
--- ── v9.4.33 ──
-UpdatesSec:Divider("v9.4.33 — posDelta Baseline (the real bug)")
-UpdatesSec:Info("Debug proved every release was (swap) — never trail-gone or tap-past")
-UpdatesSec:Label("Head/Tail always have ~40px posDelta layout gap even on TAPS")
-UpdatesSec:Label("Old HOLD_TAIL_MIN=8 marked EVERY note as hold → trail never 'collapsed'")
-UpdatesSec:Label("Real holds show posDelta 400–1100 then shrink back toward ~40")
-UpdatesSec:Info("Fix")
-UpdatesSec:Label("Real hold only if posDelta >= 80")
-UpdatesSec:Label("Taps (posDelta ~40) release on head-past")
-UpdatesSec:Label("Real holds release when posDelta falls back <= 55")
-UpdatesSec:Label("Never swap-interrupt a real hold while trail still active")
-UpdatesSec:Label("Ignore offscreen pooled notes (|head-rec| > 2500)")
-
--- ── v9.4.32 ──
-UpdatesSec:Divider("v9.4.32 — Long Hold Reset")
-UpdatesSec:Info("Only LONG holds missed the next TAP; short/medium were fine")
-UpdatesSec:Label("Cause: long-hold Head parks on receptor for the whole duration")
-UpdatesSec:Label("abs(head-rec) never grows → geometric past-release never fired")
-UpdatesSec:Label("Held note re-won pressCandidate every frame → next TAP starved")
-UpdatesSec:Info("Fix")
-UpdatesSec:Label("Confirmed hold completes when Tail height/posDelta collapses (~0)")
-UpdatesSec:Label("Currently-held note is excluded from pressCandidate")
-UpdatesSec:Label("Release still runs before Press every tick")
-
--- ── v9.4.31 ──
-UpdatesSec:Divider("v9.4.31 — Instant Release + Multi-Lane")
-UpdatesSec:Info("Problem")
-UpdatesSec:Label("After a hold finished, next TAP missed ~50% — key still held, no edge")
-UpdatesSec:Info("Fix")
-UpdatesSec:Label("RELEASE pass runs BEFORE PRESS pass every tick")
-UpdatesSec:Label("Taps: release as soon as Head is past receptor (not wait despawn)")
-UpdatesSec:Label("Holds: release when trail fully past (hold-done), else despawn")
-UpdatesSec:Label("Always keyrelease before keypress on lane swap (fresh edge)")
-UpdatesSec:Info("Simultaneous notes")
-UpdatesSec:Label("Different lanes (e.g. F+J same beat): both press same tick — independent keys")
-UpdatesSec:Label("Same lane double: nearest head wins; one press covers the window")
-
--- ── v9.4.30 ──
-UpdatesSec:Divider("v9.4.30 — Unified Press / Despawn Release")
-UpdatesSec:Info("Debug: every note has Head+Tail, AbsoluteSize 0x0 on spawn")
-UpdatesSec:Label("Classifying hold vs tap from size was impossible on first frames")
-UpdatesSec:Label("Holds were TAP'd before Tail height ever became non-zero")
-UpdatesSec:Info("New model (no hold/tap split)")
-UpdatesSec:Label("PRESS when Head.AbsolutePosition enters receptor window")
-UpdatesSec:Label("HOLD the key while the note exists in Lanes")
-UpdatesSec:Label("RELEASE when game removes the note (despawn)")
-UpdatesSec:Label("Taps despawn fast → short press | Holds stay → real hold")
-
--- ── v9.4.29 ──
-UpdatesSec:Divider("v9.4.29 — Live Hold Classification")
-UpdatesSec:Info("Debug proved AbsoluteSize is 0x0 on first sight of every note")
-UpdatesSec:Label("Old code locked isHold=false forever on that first 0-size frame")
-UpdatesSec:Label("Gakuran structure: NoteTemplate → Head + Tail ImageLabels")
-UpdatesSec:Info("Fix")
-UpdatesSec:Label("Re-evaluate Tail height EVERY frame (AbsoluteSize + Offset + Scale)")
-UpdatesSec:Label("Hold if TailH >= 8 OR |TailY-HeadY| >= 8 OR frameH >= 60")
-UpdatesSec:Label("Press uses Head.AbsolutePosition.Y (leading edge)")
-UpdatesSec:Label("Debug dumps only once geometry is non-zero")
-
--- ── v9.4.28 ──
-UpdatesSec:Divider("v9.4.28 — Hold Notes Robust")
-
--- ── v9.4.27 ──
-UpdatesSec:Divider("v9.4.27 — Hold Detection + Diagnostics")
-UpdatesSec:Info("Hypothesis")
-UpdatesSec:Label("Gakuran hold notes may not have a child named 'Tail'")
-UpdatesSec:Label("Our hasTail check failed → fell into tap branch → tapped the hold")
-UpdatesSec:Info("New detection")
-UpdatesSec:Label("Hold = has Tail child OR note frame itself is tall (>60px)")
-UpdatesSec:Label("Head Y = tail bottom (if child) OR note frame bottom (fallback)")
-UpdatesSec:Label("Release = note removed from Lanes (.Parent == nil)")
-UpdatesSec:Info("Debug prints — enable 'Debug Parry' in Combat tab")
-UpdatesSec:Label("Logs note size, children, and press events")
-UpdatesSec:Label("Help us see WHAT the hold notes actually look like in-game")
-
--- ── v9.4.26 ──
-UpdatesSec:Divider("v9.4.26 — Hold Note Identity Tracking")
-UpdatesSec:Info("The actual actual fix (ported from lolbeans)")
-UpdatesSec:Label("HeldKeys[lane] now stores the NOTE reference, not a boolean")
-UpdatesSec:Label("Prevents re-pressing the same hold on next frame = no tap-tap-tap")
-UpdatesSec:Info("The bug in v9.4.23-25")
-UpdatesSec:Label("After release, next frame saw head still in threshold")
-UpdatesSec:Label("HeldKeys was false (just released) → PRESS fired again")
-UpdatesSec:Label("Each frame = new press+release = game registered as multiple TAPS")
-UpdatesSec:Info("Press is +15 past receptor (matches lolbeans)")
-UpdatesSec:Label("Gakuran hold-note hit zone sits slightly past the visual receptor")
-UpdatesSec:Label("Pressing centered on receptor missed the actual registration window")
-UpdatesSec:Info("Release: tail top crosses receptor + 10ms delay before clear")
-
--- ── v9.4.25 ──
-UpdatesSec:Divider("v9.4.25 — Game-Driven Hold Release")
-UpdatesSec:Info("The actual fix")
-UpdatesSec:Label("Press on head arrival (geometry — correct)")
-UpdatesSec:Label("Release when game removes the note from Lanes")
-UpdatesSec:Label("No more guessing hold duration from tail length math")
-UpdatesSec:Info("Why previous attempts failed")
-UpdatesSec:Label("Tail-top-crossing release fired too fast for short tails")
-UpdatesSec:Label("Game registered the quick press-release as TAP → BAD rating")
-UpdatesSec:Label("The game ITSELF knows when hold is complete — removes note")
-UpdatesSec:Info("Added safety")
-UpdatesSec:Label("Head 200px past receptor → force release (stuck key protection)")
-
--- ── v9.4.24 ──
-UpdatesSec:Divider("v9.4.24 — Held Notes Actual Fix")
-UpdatesSec:Info("Fixed v9.4.23 regression")
-UpdatesSec:Label("Used notePos.Y as head — wrong, that's the whole-frame top (= tail top)")
-UpdatesSec:Label("Actual head is at tail BOTTOM: tail.AbsolutePosition.Y + Size.Y")
-UpdatesSec:Label("Press was firing when tail top near receptor → head already past")
-UpdatesSec:Label("Release checked tail top ~immediately → instant release → tap feel")
-UpdatesSec:Info("Correct geometry")
-UpdatesSec:Label("Note frame wraps both tail (above) and head (below)")
-UpdatesSec:Label("Press when tail bottom (= head) reaches receptor")
-UpdatesSec:Label("Release when tail top reaches receptor (whole note passed)")
-
--- ── v9.4.23 ──
-UpdatesSec:Divider("v9.4.23 — Rhythm Held Notes Fix")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Held notes now press at head arrival + release at tail-top crossing")
-UpdatesSec:Label("Was: press fired late (head 15px past receptor) → missed hit window")
-UpdatesSec:Label("Was: release math was tangled → inconsistent hold duration")
-UpdatesSec:Info("Geometry — standard DDR scroll")
-UpdatesSec:Label("notePos.Y = head (what we tap)")
-UpdatesSec:Label("tail.AbsolutePosition.Y = tail TOP (last pixel to cross)")
-UpdatesSec:Label("tail.AbsoluteSize.Y = hold length × scroll speed")
-UpdatesSec:Info("Press when head at receptor | Release when tail top crosses")
-
--- ── v9.4.22 ──
-UpdatesSec:Divider("v9.4.22 — Matcha Init Fix")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("AnimationTracker.new was called with wrong args since forever")
-UpdatesSec:Label("pcall(fn, AnimationTracker, IgnoreIds) → pcall(fn, IgnoreIds)")
-UpdatesSec:Label("IgnoreIds was being set to the class table instead of our list")
-UpdatesSec:Label("Ignore filter now actually works — fewer unknown anims processed")
-UpdatesSec:Info("Not a fix for Matcha:63 LocalPlayer error — that's external")
-UpdatesSec:Label("Our matcha has zero LocalPlayer code at any line")
-UpdatesSec:Label("Check autoexec folder for stray scripts")
-
--- ── v9.4.21 ──
-UpdatesSec:Divider("v9.4.21 — Killed firesignal Spam")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Matcha:684 / Matcha:677 'index nil with Begin/End' spam")
-UpdatesSec:Label("firesignal fake InputObject was choking matcha's UIS listener")
-UpdatesSec:Label("Removed fireUISKey helper + all three call sites")
-UpdatesSec:Info("Back to pure VIM input")
-UpdatesSec:Label("firesignal path was marginal gain, not worth breaking matcha")
-UpdatesSec:Label("All other fixes intact — event detection, StunToken, catchalls")
-
--- ── v9.4.20 ──
-UpdatesSec:Divider("v9.4.20 — Self-M1 Regression Fix")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("v9.4.19 self-M1 lockout permanently stunned active attackers")
-UpdatesSec:Label("Every M1 you threw extended lockout by 0.5s → AP never fired")
-UpdatesSec:Label("Removed the GameConfig[animId] markStunned call entirely")
-UpdatesSec:Info("Kept the good v9.4.19 ports")
-UpdatesSec:Label("Event-driven LocalTracker.AnimationAdded — zero latency parry detection")
-UpdatesSec:Label("StunToken auto-recovery")
-UpdatesSec:Label("Local health exit in main loop")
-UpdatesSec:Info("Added safety")
-UpdatesSec:Label("HB now clears LocalStunned if no stun anim actually playing")
-UpdatesSec:Label("Prevents stuck-stunned if StunToken timer glitches")
-
--- ── v9.4.19 ──
-UpdatesSec:Divider("v9.4.19 — Lolbeans Source Ports")
-UpdatesSec:Info("Ported from lolbeans67 public source")
-UpdatesSec:Label("Separate LocalTracker — event-driven anim detection (0ms vs 16ms)")
-UpdatesSec:Label("Self-M1 protection — AP won't fire during our own attack commits")
-UpdatesSec:Label("StunToken pattern — clean multi-hit stun recovery")
-UpdatesSec:Label("Local health exit — main loop no-ops when we're dead")
-UpdatesSec:Info("The self-M1 fix is huge")
-UpdatesSec:Label("Was: AP tried to parry during your M1 → attack cancelled → input fight")
-UpdatesSec:Label("Now: AP sees our own M1 anim → marks stunned → leaves input alone")
-UpdatesSec:Label("This is what was causing the \"inputs fighting each other\" feel")
-UpdatesSec:Info("HB local scan now backup only — AnimationAdded is primary")
-
--- ── v9.4.18 ──
-UpdatesSec:Divider("v9.4.18 — Dual-Fire Input")
-UpdatesSec:Info("Added")
-UpdatesSec:Label("firesignal path alongside VIM for F press/release")
-UpdatesSec:Label("Fires UIS.InputBegan directly where executor supports it")
-UpdatesSec:Label("5-10% latency improvement on compatible executors")
-UpdatesSec:Info("Architectural reality")
-UpdatesSec:Label("Private scripts using game offsets bypass VIM entirely")
-UpdatesSec:Label("That requires paid offset access or game RE")
-UpdatesSec:Label("Open-source AP can't fully match that feel")
-UpdatesSec:Info("What else closes the gap: Auto-R, live timings, Heavy Ready")
-
--- ── v9.4.17 ──
-UpdatesSec:Divider("v9.4.17 — Resolution Catchall")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Failed parries now release F immediately — AP ready for next hit")
-UpdatesSec:Label("Counter-parried mid-swing — same instant release")
-UpdatesSec:Label("Any state-to-IDLE transition triggers release")
-UpdatesSec:Info("Covered scenarios")
-UpdatesSec:Label("Parry succeeded (v9.4.16)")
-UpdatesSec:Label("Got stunned/hit (v9.4.16)")
-UpdatesSec:Label("ParryFailed anim played (new)")
-UpdatesSec:Label("Counter-parried anim played (new)")
-UpdatesSec:Label("Deadline reached (always)")
-UpdatesSec:Info("INPUT_PENDING still holds F — that's \"waiting for registration\"")
-
--- ── v9.4.16 ──
-UpdatesSec:Divider("v9.4.16 — Crispy Release")
-UpdatesSec:Info("Changed")
-UpdatesSec:Label("F releases on parry success — walkspeed back in ~80ms vs 270ms")
-UpdatesSec:Label("F releases if we get stunned — no visible lock-up")
-UpdatesSec:Info("Why movement felt interrupted")
-UpdatesSec:Label("Not VIM — the game slows walkspeed while F is held (blocking)")
-UpdatesSec:Label("We were holding F 170-220ms past when parry already registered")
-UpdatesSec:Label("Now we release the moment PARRYING state is detected")
-UpdatesSec:Info("Net effect")
-UpdatesSec:Label("Snappier post-parry movement, less drag during combos")
-UpdatesSec:Label("AP timing + success rate unchanged — only hold duration shortened")
-
--- ── v9.4.15 ──
-UpdatesSec:Divider("v9.4.15 — Smart Range Gate")
-UpdatesSec:Info("Changed")
-UpdatesSec:Label("Default AP Range 14 → 11 (tight, legit-looking)")
-UpdatesSec:Label("Added velocity-aware predictive gate — fires on real threats only")
-UpdatesSec:Info("How the smart gate works")
-UpdatesSec:Label("In reach (dist <= range) → fire normally")
-UpdatesSec:Label("Out of reach + closing fast + will reach in 0.3s → fire (dash-in)")
-UpdatesSec:Label("Out of reach + stationary or slow → skip (not a real threat)")
-UpdatesSec:Info("Why it matters")
-UpdatesSec:Label("Firing from 14 studs on stationary targets reads as cheat")
-UpdatesSec:Label("Smart gate catches dash-ins without the sus static-range tell")
-
--- ── v9.4.14 ──
-UpdatesSec:Divider("v9.4.14 — Range + Phantom F Fix")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("11-stud hits unparried — default AP Range 10 → 14 studs")
-UpdatesSec:Label("Phantom F held after target retreats — now releases immediately")
-UpdatesSec:Label("Covers reach of nearly all FFTM M1s (10-14 stud typical)")
-UpdatesSec:Info("Early release triggers")
-UpdatesSec:Label("1. Target despawned")
-UpdatesSec:Label("2. Target died (health <= 0)")
-UpdatesSec:Label("3. Target left AP range (new in v9.4.14)")
-UpdatesSec:Info("2-stud tolerance on range check — no flicker at boundary")
-
--- ── v9.4.13 ──
-UpdatesSec:Divider("v9.4.13 — Input Gating")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Physical keys no longer leak into game when menu is visible")
-UpdatesSec:Label("WASD/F/etc blocked while menu is up — click freely")
-UpdatesSec:Label("Game input restored automatically on menu hide (RightShift)")
-UpdatesSec:Info("Why it mattered")
-UpdatesSec:Label("Your real F presses were fighting AP's synthetic F")
-UpdatesSec:Label("WASD leaking caused character drift during menu browse")
-UpdatesSec:Label("AP keys bypass gating via VirtualInputManager — zero impact to AP")
-UpdatesSec:Info("Hooks")
-UpdatesSec:Label("PlayerModule controls disabled/enabled on menu toggle")
-UpdatesSec:Label("setrobloxinput follows menu state")
-UpdatesSec:Label("CharacterAdded re-applies state after respawn")
-UpdatesSec:Label("Cleanup always restores input (never leave user stuck)")
-
--- ── v9.4.12 ──
-UpdatesSec:Divider("v9.4.12 — Faster Detection + Legacy Cut")
-UpdatesSec:Info("Faster")
-UpdatesSec:Label("cycleTargets now 10Hz (was 2Hz) — new enemies in 100ms")
-UpdatesSec:Label("Target label refresh also 10Hz, smoother updates")
-UpdatesSec:Info("Removed")
-UpdatesSec:Label("[G] Gakuran .lua config support — stripped entirely")
-UpdatesSec:Label("[L] Olympus/ legacy folder enumeration — stripped")
-UpdatesSec:Label("loadProfile: JSON only now, no loadstring path")
-UpdatesSec:Info("Profiles tab is clean — only your Syndicatus/ configs show")
-
--- ── v9.4.11 ──
-UpdatesSec:Divider("v9.4.11 — Dead Target Fix")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Jitter AP — F no longer fires when target is dead")
-UpdatesSec:Label("Live health check in main loop (was 2Hz cycle, now per-frame)")
-UpdatesSec:Label("Early F release when fired-upon target dies mid-attack")
-UpdatesSec:Info("Why it happened")
-UpdatesSec:Label("cycleTargets ran 2Hz — dead targets stayed in list 500ms")
-UpdatesSec:Label("Death ragdoll made TimePosition bounce — fake loop re-arms")
-UpdatesSec:Label("F stayed held into corpse while third party caved us")
-UpdatesSec:Info("regData now stores Target ref for post-fire death validation")
-
--- ── v9.4.10 ──
-UpdatesSec:Divider("v9.4.10 — Edge-Trigger Fix")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Mid-combo parry drops — F now releases before re-press")
-UpdatesSec:Label("Each attack gets its own fresh input event (edge-triggered games)")
-UpdatesSec:Info("Why this mattered")
-UpdatesSec:Label("Fast M1 chains overlapped ParryHold (0.27s)")
-UpdatesSec:Label("Held F = block, not fresh parry — mid-combo M1s hit unparried")
-UpdatesSec:Label("Fix forces release+press so game sees distinct parry attempts")
-UpdatesSec:Info("Wrestling, MuayThai, Striker (B) all benefit most")
-
--- ── v9.4.9 ──
-UpdatesSec:Divider("v9.4.9 — Comment Pass")
-UpdatesSec:Info("Cleaned")
-UpdatesSec:Label("Stripped version-tag comments throughout source")
-UpdatesSec:Label("Header reduced to identity + Updates-tab pointer")
-UpdatesSec:Label("BG image URL points to syndicatusAP repo")
-UpdatesSec:Info("No behavioral changes — all AP logic preserved")
-
--- ── v9.4.8 ──
-UpdatesSec:Divider("v9.4.8 — Rebrand")
-UpdatesSec:Info("Changed")
-UpdatesSec:Label("Olympus → Syndicatus (title, notifies, print tags, identifiers)")
-UpdatesSec:Label("_G.__SyndicatusAP (legacy _G.__OlympusAP cleaned on upgrade)")
-UpdatesSec:Label("Profiles save to Syndicatus/ folder")
-UpdatesSec:Label("Share format tag updated — importer still accepts legacy tag")
-
--- ── v9.4.7 ──
-UpdatesSec:Divider("v9.4.7 — Strip Pass")
-UpdatesSec:Info("Removed")
-UpdatesSec:Label("Visuals section entirely (Personal HP + Opponent HP + View Range)")
-UpdatesSec:Label("Performance section (Low Lag Mode had no purpose without HP)")
-UpdatesSec:Label("Facing Angle slider — locked to source constant 0.1")
-UpdatesSec:Label("~230 lines of dead GUI code stripped")
-UpdatesSec:Info("Game has native HP displays — custom bars were redundant surface")
-
--- ── v9.4.6 ──
-UpdatesSec:Divider("v9.4.6 — HP Fix + Timing Lock")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("Personal HP now renders — parented to protected GUI container")
-UpdatesSec:Label("Opponent HP bars now render — same fix via gethui()")
-UpdatesSec:Label("Both survive game-side PlayerGui sanitization sweeps")
-UpdatesSec:Info("Removed")
-UpdatesSec:Label("Parry Hold slider (locked to source default: 0.27s)")
-UpdatesSec:Label("Parry Window slider (locked to source default: 0.20s)")
-UpdatesSec:Info("Hard-lock prevents accidental AP breakage from misconfigured profiles")
-
--- ── v9.4.5 ──
-UpdatesSec:Divider("v9.4.5 — Techs + Visuals Pack")
-UpdatesSec:Info("Added")
-UpdatesSec:Label("Anti Feint — releases F if attack cancels pre-parry")
-UpdatesSec:Label("Crit Defense — 50/50 F/Q on Heavy/M2 (overrides AutoDodge)")
-UpdatesSec:Label("Wing Chun Fake Wiff — rotates away + fires M1 to bait counter")
-UpdatesSec:Label("Shadow Step (Z) / Shadow Crit (B) — rapid F+Q taps")
-UpdatesSec:Label("Personal HP — compact health bar at screen bottom")
-UpdatesSec:Label("Opponent HP — billboard bars over nearby players")
-UpdatesSec:Label("HP View Range slider (1–200 studs)")
-UpdatesSec:Label("Low Lag Mode — suppresses visual overlays")
-UpdatesSec:Label("New tab: Techs")
-UpdatesSec:Label("New Settings sections: Visuals + Performance")
-UpdatesSec:Info("All v9.4.5 keys persist in Save + Share payloads")
-
--- ── v9.4.4 ──
-UpdatesSec:Divider("v9.4.4 — FPS Pass")
-UpdatesSec:Info("Added")
-UpdatesSec:Label("Menu auto-perf — tweens OFF when menu hidden (RightShift)")
-UpdatesSec:Label("Full INS animations restored when menu is visible")
-UpdatesSec:Info("Changed")
-UpdatesSec:Label("Live BlockStart recompute throttled to every 3rd RS frame")
-UpdatesSec:Label("cycleTargets sort comparator hoisted (no closure realloc)")
-UpdatesSec:Label("HB local anim scan early-exits when AP disabled")
-UpdatesSec:Info("Zero AP delta — all pure performance work")
-
--- ── v9.4.3 ──
-UpdatesSec:Divider("v9.4.3 — Consistency + Sharing")
-UpdatesSec:Info("Added — AP consistency (silent, always-on)")
-UpdatesSec:Label("Live BlockStart recompute — tracks ping drift mid-windup")
-UpdatesSec:Label("Movement bias — speed > 20 studs/s shifts fire -15ms")
-UpdatesSec:Label("Walk bias — speed > 8 studs/s shifts fire -8ms")
-UpdatesSec:Label("Ping-jitter window expansion (bounded ±25ms shift)")
-UpdatesSec:Label("Early-exit RS AP eval on LocalStunned")
-UpdatesSec:Info("Added — Config sharing (Profiles tab)")
-UpdatesSec:Label("Export to Clipboard")
-UpdatesSec:Label("Import from Clipboard")
-UpdatesSec:Label("Import from URL (gist/pastebin raw)")
-UpdatesSec:Info("Changed")
-UpdatesSec:Label("Menu: dropped SetPerformance(true) — animations restored")
-UpdatesSec:Label("Reduced theme-reapply stacking (5 → 3)")
-UpdatesSec:Label("Local anim-state scan moved from RS to Heartbeat")
-
--- ── v9.4.2 ──
-UpdatesSec:Divider("v9.4.2 — Cleanup Pass")
-UpdatesSec:Info("Removed (dead code)")
-UpdatesSec:Label("_defer function (never called)")
-UpdatesSec:Label("_origCycle variable (never referenced)")
-UpdatesSec:Label("PlayersSvc fallback branch (unreachable)")
-UpdatesSec:Info("Fixed")
-UpdatesSec:Label("FacingThreshold = 0 now loads from profile (was silently skipped)")
-UpdatesSec:Label("AutoHeight + HeightInfluence persist on save/reload")
-UpdatesSec:Label("Cleanup nil-guard on empty connections table")
-UpdatesSec:Info("Optimized")
-UpdatesSec:Label("Ping cache @ 10Hz (was per-registry-create)")
-UpdatesSec:Label("Height cache (weak-keyed per character)")
-UpdatesSec:Label("Rhythm KeyByte precomputed in ReceptorXMap")
-UpdatesSec:Label("pairs → ipairs on Lanes:GetChildren")
-UpdatesSec:Label("tostring(char) hoisted from inner anim loop")
-UpdatesSec:Label("cycleTargets arrays hoisted to module locals")
-UpdatesSec:Label("Facing-dot pcall unwrapped (pure math)")
-UpdatesSec:Label("IsHeavy helper (de-dup from 2 inline copies)")
-UpdatesSec:Info("Hardened")
-UpdatesSec:Label("BlockStart/BlockEnd/Dodge forward-declared (de-leaked from _G)")
-UpdatesSec:Label("RhythmAutoHitTick made local (de-leaked from _G)")
-UpdatesSec:Label("UnknownLog capped at 500 entries")
-
--- ── Styles ──
-UpdatesSec:Divider("Styles")
-UpdatesSec:Info("5 styles added")
-UpdatesSec:Label("??? — Perfect Copy")
-UpdatesSec:Label("Epic — Aikido")
-UpdatesSec:Label("Uncommon — Taijutsu")
-UpdatesSec:Label("Uncommon — Hikaken")
-UpdatesSec:Label("Uncommon — Giovanna")
-UpdatesSec:Divider("Style Notes")
-UpdatesSec:Info("Aikido M2 is a counter (like Wing Chun). Force-parried — never auto-dodged.")
-UpdatesSec:Label("Timing sliders: 0.001 step (thousandths)")
-UpdatesSec:Label("Kyokushin M2 id updated (+80822959210741)")
-
--- ── Coming Soon ──
-SoonSec:Info("Planned")
-SoonSec:Label("Auto Combo (M1 after parry)")
-SoonSec:Label("Health-Safe Targeting")
-SoonSec:Label("Style Detection Display")
-SoonSec:Label("Snap Lock")
-SoonSec:Label("Profile Quick-Switch keybind")
-SoonSec:Label("X Target (manual target lock)")
-SoonSec:Label("Timing Learner (auto-tune via trials)")
-SoonSec:Label("Record Test Logs")
-SoonSec:Label("Auto R (universal auto-crit)")
-SoonSec:Label("Damage Logs")
-SoonSec:Label("Named Configs polish")
-SoonSec:Label("Add unknowns to ignore list (one-click)")
-
-SoonSec:Divider("Credit")
-SoonSec:Info("Made By Fgonzxlez")
-
--- INS UI drives the AP toggle via the keybind pill (Toggle mode).
--- RightShift toggles menu visibility; Z/B drive Shadow Step/Crit when enabled.
-local UIS = game:GetService("UserInputService")
-SyndicatusState:AddConnection(UIS.InputBegan:Connect(function(inp, gpe)
-    if not SyndicatusState.Alive then return end
-    if gpe then return end
-    if inp.UserInputType == Enum.UserInputType.Keyboard then
-        if inp.KeyCode == Enum.KeyCode.RightShift then
-            menuOpen = not menuOpen
-            menuVisible = not menuVisible
-            syncMenuPerformance()
-            setGameInputEnabled(not menuVisible)  -- menu visible → block game input
-        elseif CFG.ShadowStep and inp.KeyCode == Enum.KeyCode.Z then
-            task.spawn(doShadowSequence)
-        elseif CFG.ShadowCrit and inp.KeyCode == Enum.KeyCode.B then
-            task.spawn(doShadowSequence)
-        end
-    end
-end))
-
-refreshDrop()
-setMenuInput(false)
--- Initial input state matches initial menu visibility (menu visible on inject = block game input)
-setGameInputEnabled(not menuVisible)
-
-pcall(function() SyndicatusState.UI_Window = UI_Window end)
-
--- Re-apply after INS config autosave settles. One deferred catch is enough —
--- stacking multiple delayed reapplies caused drag frame-stutter.
-applyMenuBackground()
-applyDarkTheme()
-syncMenuPerformance()
-task.defer(function() applyMenuBackground() applyDarkTheme() end)
-task.delay(1.0, function() applyMenuBackground() applyDarkTheme() end)
-UI_Library:Notify("Syndicatus","v9.4.40 | Taps = lolbeans 50ms press; holds unchanged; +awakened IDs")
-print("[Syndicatus v9.4.40] TAP path ported from lolbeans (press+0.05+release) | holds keep peak/hold-done")
+__LB67_CombatRuntime()
