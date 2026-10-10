@@ -3058,6 +3058,19 @@ local SelectAllMode = true
 local TargetCharacters = {}
 local EspTrackers = {}
 
+-- Names we intend to keep locked (survives death → respawn new Model)
+-- MUST be declared before UpdateTargetCharacters (same scope, not nil)
+local LockedTargetNames = {}
+local function rememberLockedNames(list)
+    table.clear(LockedTargetNames)
+    if type(list) ~= "table" then return end
+    for _, c in ipairs(list) do
+        if c and type(c.Name) == "string" and c.Name ~= "" then
+            LockedTargetNames[c.Name] = true
+        end
+    end
+end
+
 local CurrentIndex = 1
 local COLOR_WHITE = Color3.fromRGB(255, 255, 255)
 local COLOR_RED = Color3.fromRGB(255, 50, 50)
@@ -3139,8 +3152,15 @@ local function ResetCombatTrackers(reason)
     LastPendingRegData = nil
     InputRegisteredTime = nil
     ParryRegisteredTime = nil
-    KeyHeld = false
     Stunned = false
+    -- Always release a stuck F hold so AP can fire again after death/grip
+    if KeyHeld then
+        KeyHeld = false
+        ReleaseDeadline = 0
+        pcall(function()
+            if type(keyrelease) == "function" then keyrelease(ParryKey) end
+        end)
+    end
     if ParryState then
         CurrentParryState = ParryState.IDLE
     end
@@ -3949,6 +3969,9 @@ end
 function UpdateTargetCharacters(charactersList)
     ClearAllEspTrackers()
     table.clear(TargetCharacters)
+    if type(rememberLockedNames) == "function" then
+        rememberLockedNames(charactersList)
+    end
 
     local wantEsp = NoCrashState.CombatEspEnabled or NoCrashState.AnimDebugEspEnabled
 
@@ -4361,7 +4384,38 @@ local _localReady = false
 local _mainLoopErrAt = 0
 local _lastPruneAt = 0
 
+local function rebindRespawnedTargets()
+    if next(LockedTargetNames) == nil then return end
+    local all = nil
+    pcall(function() all = GetAllCharactersInFolder() end)
+    if type(all) ~= "table" then return end
+
+    local haveName = {}
+    for _, c in ipairs(TargetCharacters) do
+        if c and c.Name then haveName[c.Name] = true end
+    end
+
+    local wantEsp = NoCrashState.CombatEspEnabled or NoCrashState.AnimDebugEspEnabled
+    for _, c in ipairs(all) do
+        local n = c and c.Name
+        if n and LockedTargetNames[n] and not haveName[n] and characterTrackable(c) then
+            table.insert(TargetCharacters, c)
+            haveName[n] = true
+            if wantEsp and c:FindFirstChild("HumanoidRootPart") and ESP_Utility and ESP_Utility.NewTracker then
+                pcall(function()
+                    local tracker = ESP_Utility.NewTracker(c.HumanoidRootPart, c.Name, COLOR_RED)
+                    if tracker then EspTrackers[c] = tracker end
+                end)
+            end
+            if CFG and CFG.DebugParry then
+                print("[Sharingan] rebound target after respawn:", n)
+            end
+        end
+    end
+end
+
 local function PruneDeadTargets()
+    local removed = false
     for i = #TargetCharacters, 1, -1 do
         local c = TargetCharacters[i]
         if not characterTrackable(c) then
@@ -4375,8 +4429,19 @@ local function PruneDeadTargets()
                 end)
                 EspTrackers[c] = nil
             end
+            -- Drop frame cache entry for dead Model
+            FrameAnimCache[c] = nil
             table.remove(TargetCharacters, i)
+            removed = true
         end
+    end
+    if removed then
+        -- Dead target mid-parry → release stuck F
+        if KeyHeld and #TargetCharacters == 0 then
+            ResetCombatTrackers("all-targets-dead")
+        end
+        -- Try to pick up the same people on their new character Models
+        rebindRespawnedTargets()
     end
 end
 
@@ -4408,21 +4473,46 @@ local function MainLoop()
 
     local localChar = LocalPlayer.Character
     if localChar ~= _cachedChar then
+        local prev = _cachedChar
         _cachedChar = localChar
         _cachedHum = localChar and localChar:FindFirstChildWhichIsA("Humanoid")
         _localReady = false
-        if localChar then
+        -- Only full reset when we actually change to a new living character
+        -- (not on the nil gap mid-death — that was wiping state then leaving AP dead)
+        if localChar and prev and prev ~= localChar then
             ResetCombatTrackers("character-swap")
+        elseif localChar and not prev then
+            ResetCombatTrackers("character-appear")
+        elseif not localChar then
+            -- Death gap: release stuck F, keep registry clean
+            if KeyHeld then
+                KeyHeld = false
+                ReleaseDeadline = 0
+                pcall(function() keyrelease(ParryKey) end)
+            end
         end
     end
+
+    -- Re-resolve humanoid if cache went stale (destroyed instance)
     local localHumanoid = _cachedHum
-    if not localHumanoid or localHumanoid.Health <= 0 then
+    if localChar and (not localHumanoid or localHumanoid.Parent == nil) then
+        _cachedHum = localChar:FindFirstChildWhichIsA("Humanoid")
+        localHumanoid = _cachedHum
         _localReady = false
+    end
+
+    if not localChar or not localHumanoid or localHumanoid.Health <= 0 then
+        _localReady = false
+        -- Safety: never leave F held across death
+        if KeyHeld then
+            KeyHeld = false
+            ReleaseDeadline = 0
+            pcall(function() keyrelease(ParryKey) end)
+        end
         scheduler.update()
         return
     end
 
-    -- Don't hammer LocalTracker until Animator exists (stops resolve spam + empty AP)
     if not _localReady then
         _localReady = characterTrackable(localChar)
         if not _localReady then
@@ -4444,23 +4534,32 @@ local function MainLoop()
         warn("[MainLoop] ParryTask: ", err)
     end
 
+    -- Stuck-key watchdog (deadline missed / target died mid-hold)
+    if KeyHeld and now > (ReleaseDeadline + 1.25) then
+        ResetCombatTrackers("stuck-key-watchdog")
+    end
+
     scheduler.update()
     NoCrashState:UpdateOverlays()
 
     if (now - LastCycleCheck) >= UTILITY_TICK then
         LastCycleCheck = now
-        -- Drop dead/missing-Animator targets so we don't soft-lock AP on corpses
-        if (now - _lastPruneAt) >= 0.5 then
+        if (now - _lastPruneAt) >= 0.35 then
             _lastPruneAt = now
             PruneDeadTargets()
-            -- Soft recovery: if AP is on but local lost trackability, wipe stale memory caches
-            if CFG.AutoParry and _cachedChar and not characterTrackable(_cachedChar) then
+            if CFG.AutoParry and localChar and not characterTrackable(localChar) then
                 _localReady = false
                 ResetCombatTrackers("local-untrackable")
             end
         end
-        if CFG.AutoTargetNearest then
-            CycleEvent()
+        -- Auto retarget always; also force cycle if we lost everyone (respawn recovery)
+        if CFG.AutoTargetNearest or (#TargetCharacters == 0 and next(LockedTargetNames) ~= nil) then
+            if CFG.AutoTargetNearest then
+                CycleEvent()
+            else
+                -- Manual lock: only rebind by name (already tried in prune)
+                rebindRespawnedTargets()
+            end
         end
         ProcessEspAndLogging()
     end
