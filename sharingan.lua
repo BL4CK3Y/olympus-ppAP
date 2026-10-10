@@ -1799,7 +1799,7 @@ pcall(function()
 end)
 
 -- Menu background image (from Syndicatus)
-local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/syndicatusAP/main/content.png"
+local BG_IMAGE_URL = "https://raw.githubusercontent.com/BL4CK3Y/SharinganAP/main/sharingan.jpg"
 local function applyMenuBackground()
     pcall(function()
         if UI_Library and UI_Library.SetBackgroundImage then
