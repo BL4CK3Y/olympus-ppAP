@@ -1,4 +1,3 @@
--- Olympus AP loader
 local SCRIPT_URL = "https://raw.githubusercontent.com/BL4CK3Y/SharinganAP/main/sharingan.lua"
 
 local ok, err = pcall(function()
